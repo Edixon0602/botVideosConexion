@@ -1,0 +1,21 @@
+# Entornos Virtuales
+venv/
+env/
+.venv/
+
+# Variables de Entorno (¡MUY IMPORTANTE NO SUBIR ESTO!)
+.env
+
+# Archivos de Sesión de Pyrogram (Contienen la sesión de tu bot)
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.pyc
+
+# Archivos temporales de descargas
+downloads/
+*.mp4
+*.mkv
+*.avi
