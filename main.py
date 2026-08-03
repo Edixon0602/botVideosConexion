@@ -100,6 +100,26 @@ async def handle_video(client: Client, message: Message):
         logger.error(f"Error procesando video: {e}")
         await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
 
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Servidor web falso para que Render.com no apague el bot
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+        
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"Servidor web falso escuchando en el puerto {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
+    # Iniciar el servidor web falso en segundo plano
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
     print("Iniciando bot con Pyrogram... (Soporta descargas de hasta 2GB)")
     app.run()
