@@ -1,6 +1,15 @@
 import os
 import logging
 from ftplib import FTP
+import asyncio
+
+# Parche para Render y Python 3.10+ (corrige el error de 'no current event loop')
+try:
+    loop = asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
