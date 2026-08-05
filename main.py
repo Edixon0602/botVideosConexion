@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 from ftplib import FTP
 import asyncio
+import threading
 
 # Parche para Render y Python 3.10+ (corrige el error de 'no current event loop')
 try:
@@ -13,6 +15,8 @@ except RuntimeError:
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, flash, Response
 
 # Configurar logging
 logging.basicConfig(
@@ -33,17 +37,35 @@ FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 FTP_UPLOAD_PATH = os.getenv("FTP_UPLOAD_PATH")
 
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
+
 if not BOT_TOKEN or BOT_TOKEN == "tu_token_aqui":
     print("⚠️ ERROR: POR FAVOR, COLOCA TU TOKEN EN EL ARCHIVO .env")
     exit(1)
 
 if not API_ID or API_ID == "tu_api_id_aqui":
     print("⚠️ ERROR: Faltan API_ID y API_HASH en .env")
-    print("⚠️ Ve a https://my.telegram.org, inicia sesión, ve a 'API development tools' y crea una app para obtenerlos.")
     exit(1)
 
+# Archivo JSON para almacenar usuarios permitidos
+USERS_FILE = 'users.json'
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return []
+    try:
+        with open(USERS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f)
+
 # Inicializar cliente de Pyrogram
-# Esto crea una sesión local llamada "mi_bot_videos.session"
 app = Client(
     "mi_bot_videos",
     api_id=API_ID,
@@ -76,9 +98,18 @@ async def start(client: Client, message: Message):
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
+    user_id = message.from_user.id
+    
+    # Verificación de seguridad
+    allowed_users = load_users()
+    # str(user_id) porque en JSON todo se guarda como string a veces, pero probemos int y str
+    if user_id not in allowed_users and str(user_id) not in allowed_users:
+        logger.warning(f"Acceso denegado al usuario: {user_id}")
+        await message.reply_text("❌ No estás autorizado para subir videos a este bot. Pide acceso al administrador indicando tu ID: `" + str(user_id) + "`")
+        return
+
     # Extraer información del archivo (ya sea video o documento como MP4)
     file = message.video or message.document
-    
     if not file:
         return
         
@@ -99,36 +130,99 @@ async def handle_video(client: Client, message: Message):
         # 2. Subir por FTP
         upload_to_ftp(local_path, file_name)
         
-        # 3. Eliminar archivo temporal local para no llenar el disco duro
+        # 3. Eliminar archivo temporal local
         if os.path.exists(local_path):
             os.remove(local_path)
         
         await status_msg.edit_text(f"✅ ¡Video subido exitosamente!\nArchivo: `{file_name}`")
         
+        # Notificar al administrador si está configurado
+        if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
+            user_name = message.from_user.first_name or "Usuario"
+            try:
+                await client.send_message(
+                    chat_id=int(NOTIFICATION_CHAT_ID),
+                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`"
+                )
+            except Exception as e:
+                logger.error(f"No se pudo enviar notificación: {e}")
+        
     except Exception as e:
         logger.error(f"Error procesando video: {e}")
         await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
 
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Servidor web falso para que Render.com no apague el bot
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-        
-def run_dummy_server():
+# ==========================================
+# SERVIDOR WEB FLASK (PANEL ADMINISTRATIVO)
+# ==========================================
+
+flask_app = Flask(__name__)
+flask_app.secret_key = "super_secreto_para_flash_messages_123"
+
+def check_auth(username, password):
+    return username == ADMIN_USER and password == ADMIN_PASSWORD
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return Response(
+                'Acceso denegado al Panel de Control.', 401,
+                {'WWW-Authenticate': 'Basic realm="Login Requerido"'}
+            )
+        return f(*args, **kwargs)
+    return decorated
+
+@flask_app.route('/')
+@requires_auth
+def index():
+    users = load_users()
+    return render_template('index.html', users=users)
+
+@flask_app.route('/add', methods=['POST'])
+@requires_auth
+def add_user():
+    user_id = request.form.get('user_id')
+    if user_id:
+        try:
+            user_id = int(user_id)
+            users = load_users()
+            if user_id not in users:
+                users.append(user_id)
+                save_users(users)
+                flash(f"Usuario {user_id} autorizado correctamente.", "success")
+            else:
+                flash("El usuario ya estaba autorizado.", "error")
+        except ValueError:
+            flash("ID inválido.", "error")
+    return redirect(url_for('index'))
+
+@flask_app.route('/delete', methods=['POST'])
+@requires_auth
+def delete_user():
+    user_id = request.form.get('user_id')
+    if user_id:
+        try:
+            user_id = int(user_id)
+            users = load_users()
+            if user_id in users:
+                users.remove(user_id)
+                save_users(users)
+                flash(f"Acceso revocado para el usuario {user_id}.", "success")
+        except ValueError:
+            pass
+    return redirect(url_for('index'))
+
+def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    print(f"Servidor web falso escuchando en el puerto {port}")
-    server.serve_forever()
+    print(f"Panel Web iniciado en el puerto {port}")
+    # Importante: debug=False y use_reloader=False para no interferir con Pyrogram
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    # Iniciar el servidor web falso en segundo plano
-    threading.Thread(target=run_dummy_server, daemon=True).start()
+    # Iniciar el panel web en segundo plano
+    threading.Thread(target=run_flask, daemon=True).start()
     
     print("Iniciando bot con Pyrogram... (Soporta descargas de hasta 2GB)")
     app.run()
