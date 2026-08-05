@@ -35,6 +35,8 @@ API_HASH = os.getenv("API_HASH")
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
+# FTP_UPLOAD_PATH ya no lo usamos globalmente porque es dinámico por usuario, 
+# pero podemos dejarlo para retrocompatibilidad
 FTP_UPLOAD_PATH = os.getenv("FTP_UPLOAD_PATH")
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
@@ -54,12 +56,18 @@ USERS_FILE = 'users.json'
 
 def load_users():
     if not os.path.exists(USERS_FILE):
-        return []
+        return {}
     try:
         with open(USERS_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            # Migración: Si era una lista antigua, convertir a diccionario
+            if isinstance(data, list):
+                new_dict = {str(item): FTP_UPLOAD_PATH or "avances-informativos" for item in data}
+                save_users(new_dict)
+                return new_dict
+            return data
     except:
-        return []
+        return {}
 
 def save_users(users):
     with open(USERS_FILE, 'w') as f:
@@ -73,17 +81,30 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-def upload_to_ftp(local_file_path: str, remote_filename: str):
-    """Sube un archivo al servidor FTP"""
+def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str):
+    """Sube un archivo al servidor FTP en la carpeta específica"""
     logger.info(f"Conectando a FTP: {FTP_HOST}...")
     ftp = FTP(FTP_HOST)
     ftp.login(user=FTP_USER, passwd=FTP_PASS)
     
-    # Cambiar al directorio destino
-    try:
-        ftp.cwd(FTP_UPLOAD_PATH)
-    except Exception as e:
-        logger.warning(f"No se pudo cambiar al directorio {FTP_UPLOAD_PATH}, intentando crear o usar raíz: {e}")
+    # Limpiar el nombre de la carpeta destino
+    if target_folder:
+        target_folder = target_folder.strip("/")
+    
+    # Navegar a la carpeta destino
+    if target_folder:
+        try:
+            ftp.cwd(target_folder)
+        except Exception:
+            logger.info(f"La carpeta '{target_folder}' no existe, intentando crearla...")
+            try:
+                ftp.mkd(target_folder)
+                ftp.cwd(target_folder)
+                logger.info(f"Carpeta '{target_folder}' creada exitosamente.")
+            except Exception as e:
+                logger.error(f"Error creando la carpeta '{target_folder}': {e}")
+                ftp.quit()
+                raise Exception(f"No se pudo crear ni acceder a la carpeta destino: {target_folder}")
     
     logger.info(f"Subiendo archivo {remote_filename}...")
     with open(local_file_path, 'rb') as file:
@@ -94,7 +115,7 @@ def upload_to_ftp(local_file_path: str, remote_filename: str):
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await message.reply_text("¡Hola! Soy tu bot de subida de videos.\nEnvíame un video y lo subiré automáticamente al dashboard.")
+    await message.reply_text("¡Hola! Soy tu bot de subida de videos.\nEnvíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
@@ -105,11 +126,18 @@ async def handle_video(client: Client, message: Message):
     allowed_users = load_users()
     
     is_allowed = False
+    target_folder = ""
+    
     if user_id in allowed_users:
         is_allowed = True
-    if username:
-        if username in allowed_users or f"@{username}" in allowed_users:
+        target_folder = allowed_users[user_id]
+    elif username:
+        if username in allowed_users:
             is_allowed = True
+            target_folder = allowed_users[username]
+        elif f"@{username}" in allowed_users:
+            is_allowed = True
+            target_folder = allowed_users[f"@{username}"]
             
     if not is_allowed:
         logger.warning(f"Acceso denegado al usuario: {user_id} (@{username})")
@@ -125,7 +153,7 @@ async def handle_video(client: Client, message: Message):
     file_name = file.file_name if getattr(file, 'file_name', None) else f"video_{message.id}.mp4"
     
     # Mensaje de estado
-    status_msg = await message.reply_text(f"⏳ Descargando `{file_name}` ({file_size_mb:.2f} MB)... esto puede tardar dependiendo del tamaño.")
+    status_msg = await message.reply_text(f"⏳ Descargando `{file_name}` ({file_size_mb:.2f} MB)...")
     
     try:
         # 1. Descargar archivo
@@ -133,16 +161,16 @@ async def handle_video(client: Client, message: Message):
         local_path = await message.download()
         logger.info(f"Descarga completada: {local_path}")
         
-        await status_msg.edit_text("⏳ Subiendo video al servidor FTP...")
+        await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `/ {target_folder}` del FTP...")
         
         # 2. Subir por FTP
-        upload_to_ftp(local_path, file_name)
+        upload_to_ftp(local_path, file_name, target_folder)
         
         # 3. Eliminar archivo temporal local
         if os.path.exists(local_path):
             os.remove(local_path)
         
-        await status_msg.edit_text(f"✅ ¡Video subido exitosamente!\nArchivo: `{file_name}`")
+        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `/{target_folder}`!\nArchivo: `{file_name}`")
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
@@ -150,7 +178,7 @@ async def handle_video(client: Client, message: Message):
             try:
                 await client.send_message(
                     chat_id=int(NOTIFICATION_CHAT_ID),
-                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`"
+                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `/{target_folder}`"
                 )
             except Exception as e:
                 logger.error(f"No se pudo enviar notificación: {e}")
@@ -178,7 +206,6 @@ def requires_auth(f):
 @flask_app.route('/ping')
 def ping():
     # Ruta pública para el servicio de monitoreo (UptimeRobot, cron-job, etc)
-    # Al no tener @requires_auth, el servicio de ping no recibirá un error 401
     return "OK", 200
 
 @flask_app.route('/login', methods=['GET', 'POST'])
@@ -208,18 +235,20 @@ def index():
 @requires_auth
 def add_user():
     user_id = request.form.get('user_id')
-    if user_id:
+    ftp_path = request.form.get('ftp_path')
+    if user_id and ftp_path:
         user_id = str(user_id).strip()
+        ftp_path = str(ftp_path).strip()
         users = load_users()
-        users_str = [str(u) for u in users]
-        if user_id not in users_str:
-            users.append(user_id)
+        
+        if user_id not in users:
+            users[user_id] = ftp_path
             save_users(users)
-            flash(f"Usuario {user_id} autorizado correctamente.", "success")
+            flash(f"Usuario {user_id} autorizado para usar la carpeta /{ftp_path}.", "success")
         else:
-            flash("El usuario ya estaba autorizado.", "error")
+            flash("El usuario ya estaba autorizado. Revócalo primero si deseas cambiar su carpeta.", "error")
     else:
-        flash("Usuario inválido.", "error")
+        flash("Datos inválidos.", "error")
     return redirect(url_for('index'))
 
 @flask_app.route('/delete', methods=['POST'])
@@ -229,13 +258,8 @@ def delete_user():
     if user_id:
         user_id = str(user_id).strip()
         users = load_users()
-        users_str = [str(u) for u in users]
-        if user_id in users_str:
-            # Encontrar y eliminar el valor original (sea int o str)
-            for u in users:
-                if str(u) == user_id:
-                    users.remove(u)
-                    break
+        if user_id in users:
+            del users[user_id]
             save_users(users)
             flash(f"Acceso revocado para el usuario {user_id}.", "success")
     return redirect(url_for('index'))
