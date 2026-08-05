@@ -202,7 +202,7 @@
         {% endwith %}
 
         <form class="add-form" action="/add" method="POST">
-            <input type="number" name="user_id" placeholder="ID de Telegram del usuario" required>
+            <input type="text" name="user_id" placeholder="ID numérico o @usuario" required>
             <button type="submit">Autorizar</button>
         </form>
 
@@ -211,7 +211,7 @@
                 {% for user_id in users %}
                 <div class="user-item">
                     <div class="user-info">
-                        <span class="user-id">ID: {{ user_id }}</span>
+                        <span class="user-id">Usuario: {{ user_id }}</span>
                     </div>
                     <form action="/delete" method="POST" style="margin:0;">
                         <input type="hidden" name="user_id" value="{{ user_id }}">

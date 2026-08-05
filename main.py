@@ -98,14 +98,22 @@ async def start(client: Client, message: Message):
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
+    username = message.from_user.username
     
     # Verificación de seguridad
     allowed_users = load_users()
-    # str(user_id) porque en JSON todo se guarda como string a veces, pero probemos int y str
-    if user_id not in allowed_users and str(user_id) not in allowed_users:
-        logger.warning(f"Acceso denegado al usuario: {user_id}")
-        await message.reply_text("❌ No estás autorizado para subir videos a este bot. Pide acceso al administrador indicando tu ID: `" + str(user_id) + "`")
+    
+    is_allowed = False
+    if user_id in allowed_users:
+        is_allowed = True
+    if username:
+        if username in allowed_users or f"@{username}" in allowed_users:
+            is_allowed = True
+            
+    if not is_allowed:
+        logger.warning(f"Acceso denegado al usuario: {user_id} (@{username})")
+        await message.reply_text(f"❌ No estás autorizado para subir videos a este bot. Pide acceso al administrador indicando tu ID numérico: `{user_id}` o tu usuario: `@{username or 'Sin usuario'}`")
         return
 
     # Extraer información del archivo (ya sea video o documento como MP4)
@@ -185,17 +193,17 @@ def index():
 def add_user():
     user_id = request.form.get('user_id')
     if user_id:
-        try:
-            user_id = int(user_id)
-            users = load_users()
-            if user_id not in users:
-                users.append(user_id)
-                save_users(users)
-                flash(f"Usuario {user_id} autorizado correctamente.", "success")
-            else:
-                flash("El usuario ya estaba autorizado.", "error")
-        except ValueError:
-            flash("ID inválido.", "error")
+        user_id = str(user_id).strip()
+        users = load_users()
+        users_str = [str(u) for u in users]
+        if user_id not in users_str:
+            users.append(user_id)
+            save_users(users)
+            flash(f"Usuario {user_id} autorizado correctamente.", "success")
+        else:
+            flash("El usuario ya estaba autorizado.", "error")
+    else:
+        flash("Usuario inválido.", "error")
     return redirect(url_for('index'))
 
 @flask_app.route('/delete', methods=['POST'])
@@ -203,15 +211,17 @@ def add_user():
 def delete_user():
     user_id = request.form.get('user_id')
     if user_id:
-        try:
-            user_id = int(user_id)
-            users = load_users()
-            if user_id in users:
-                users.remove(user_id)
-                save_users(users)
-                flash(f"Acceso revocado para el usuario {user_id}.", "success")
-        except ValueError:
-            pass
+        user_id = str(user_id).strip()
+        users = load_users()
+        users_str = [str(u) for u in users]
+        if user_id in users_str:
+            # Encontrar y eliminar el valor original (sea int o str)
+            for u in users:
+                if str(u) == user_id:
+                    users.remove(u)
+                    break
+            save_users(users)
+            flash(f"Acceso revocado para el usuario {user_id}.", "success")
     return redirect(url_for('index'))
 
 def run_flask():
