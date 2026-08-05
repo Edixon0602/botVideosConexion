@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, flash, Response
+from flask import Flask, render_template, request, redirect, url_for, flash, Response, session
 
 # Configurar logging
 logging.basicConfig(
@@ -167,20 +167,36 @@ async def handle_video(client: Client, message: Message):
 flask_app = Flask(__name__)
 flask_app.secret_key = "super_secreto_para_flash_messages_123"
 
-def check_auth(username, password):
-    return username == ADMIN_USER and password == ADMIN_PASSWORD
-
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return Response(
-                'Acceso denegado al Panel de Control.', 401,
-                {'WWW-Authenticate': 'Basic realm="Login Requerido"'}
-            )
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
+
+@flask_app.route('/ping')
+def ping():
+    # Ruta pública para el servicio de monitoreo (UptimeRobot, cron-job, etc)
+    # Al no tener @requires_auth, el servicio de ping no recibirá un error 401
+    return "OK", 200
+
+@flask_app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if username == ADMIN_USER and password == ADMIN_PASSWORD:
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        else:
+            flash('Usuario o contraseña incorrectos', 'error')
+    return render_template('login.html')
+
+@flask_app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
 
 @flask_app.route('/')
 @requires_auth
