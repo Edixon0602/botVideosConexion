@@ -226,6 +226,11 @@ def logout():
     return redirect(url_for('login'))
 
 @flask_app.route('/')
+def home():
+    # Ruta pública raíz para que el servicio de ping no reciba 301/302/401
+    return "Bot is running!", 200
+
+@flask_app.route('/admin')
 @requires_auth
 def index():
     users = load_users()
