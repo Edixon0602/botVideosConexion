@@ -4,6 +4,8 @@ import logging
 from ftplib import FTP
 import asyncio
 import threading
+import urllib.request
+import time
 
 # Parche para Render y Python 3.10+ (corrige el error de 'no current event loop')
 try:
@@ -269,6 +271,19 @@ def delete_user():
             flash(f"Acceso revocado para el usuario {user_id}.", "success")
     return redirect(url_for('index'))
 
+def keep_alive_ping():
+    """Ping automático interno para burlar la inactividad de Render"""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        try:
+            time.sleep(600)
+            urllib.request.urlopen(url)
+            logger.info(f"Auto-ping interno exitoso a {url}")
+        except Exception as e:
+            logger.warning(f"Error en auto-ping interno: {e}")
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     print(f"Panel Web iniciado en el puerto {port}")
@@ -278,6 +293,9 @@ def run_flask():
 if __name__ == "__main__":
     # Iniciar el panel web en segundo plano
     threading.Thread(target=run_flask, daemon=True).start()
+    
+    # Iniciar auto-ping interno
+    threading.Thread(target=keep_alive_ping, daemon=True).start()
     
     print("Iniciando bot con Pyrogram... (Soporta descargas de hasta 2GB)")
     app.run()
