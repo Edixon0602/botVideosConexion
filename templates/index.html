@@ -63,8 +63,13 @@
 
         .add-form {
             display: flex;
-            gap: 10px;
+            flex-direction: column;
+            gap: 12px;
             margin-bottom: 30px;
+            background: rgba(15, 23, 42, 0.3);
+            padding: 20px;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         input {
@@ -115,6 +120,8 @@
             padding: 16px 20px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             transition: background 0.2s ease;
+            flex-wrap: wrap;
+            gap: 10px;
         }
 
         .user-item:hover {
@@ -129,6 +136,7 @@
             display: flex;
             align-items: center;
             gap: 12px;
+            flex-wrap: wrap;
         }
 
         .user-id {
