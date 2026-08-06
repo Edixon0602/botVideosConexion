@@ -204,17 +204,18 @@
 
         <form class="add-form" action="/add" method="POST">
             <input type="text" name="user_id" placeholder="ID numérico o @usuario" required>
+            <input type="text" name="user_name" placeholder="Nombre (ej: Juan)" required>
             <input type="text" name="ftp_path" placeholder="Ruta destino (ej: /videos)" required>
             <button type="submit">Autorizar</button>
         </form>
 
         <div class="users-list">
             {% if users %}
-                {% for user_id, ftp_path in users.items() %}
+                {% for user_id, info in users.items() %}
                 <div class="user-item">
                     <div class="user-info">
-                        <span class="user-id">Usuario: {{ user_id }}</span>
-                        <span class="user-folder" style="font-size: 13px; color: #94a3b8; background: rgba(255,255,255,0.1); padding: 2px 8px; border-radius: 4px; margin-left: 10px;">Carpeta: {{ ftp_path }}</span>
+                        <span class="user-id">Usuario: {{ user_id }} {% if info.name %}({{ info.name }}){% endif %}</span>
+                        <span class="user-folder" style="font-size: 13px; color: #94a3b8; background: rgba(255,255,255,0.1); padding: 2px 8px; border-radius: 4px; margin-left: 10px;">Carpeta: {{ info.ftp_path }}</span>
                     </div>
                     <form action="/delete" method="POST" style="margin:0;">
                         <input type="hidden" name="user_id" value="{{ user_id }}">

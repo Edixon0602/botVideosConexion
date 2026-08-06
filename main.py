@@ -62,11 +62,22 @@ def load_users():
     try:
         with open(USERS_FILE, 'r') as f:
             data = json.load(f)
-            # Migración: Si era una lista antigua, convertir a diccionario
+            # Migración desde lista antigua
             if isinstance(data, list):
-                new_dict = {str(item): FTP_UPLOAD_PATH or "avances-informativos" for item in data}
+                new_dict = {str(item): {"ftp_path": FTP_UPLOAD_PATH or "avances-informativos", "name": "Usuario"} for item in data}
                 save_users(new_dict)
                 return new_dict
+            
+            # Migración desde diccionario antiguo (solo strings) a diccionario con nombre
+            if isinstance(data, dict):
+                needs_migration = False
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        data[k] = {"ftp_path": v, "name": "Usuario"}
+                        needs_migration = True
+                if needs_migration:
+                    save_users(data)
+                return data
             return data
     except:
         return {}
@@ -117,7 +128,7 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await message.reply_text("¡Hola! Soy tu bot de subida de videos.\nEnvíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
+    await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
@@ -129,21 +140,25 @@ async def handle_video(client: Client, message: Message):
     
     is_allowed = False
     target_folder = ""
+    user_name = "Usuario"
     
     if user_id in allowed_users:
         is_allowed = True
-        target_folder = allowed_users[user_id]
+        target_folder = allowed_users[user_id].get("ftp_path", "")
+        user_name = allowed_users[user_id].get("name", "Usuario")
     elif username:
         if username in allowed_users:
             is_allowed = True
-            target_folder = allowed_users[username]
+            target_folder = allowed_users[username].get("ftp_path", "")
+            user_name = allowed_users[username].get("name", "Usuario")
         elif f"@{username}" in allowed_users:
             is_allowed = True
-            target_folder = allowed_users[f"@{username}"]
+            target_folder = allowed_users[f"@{username}"].get("ftp_path", "")
+            user_name = allowed_users[f"@{username}"].get("name", "Usuario")
             
     if not is_allowed:
         logger.warning(f"Acceso denegado al usuario: {user_id} (@{username})")
-        await message.reply_text(f"❌ No estás autorizado para subir videos a este bot. Pide acceso al administrador indicando tu ID numérico: `{user_id}` o tu usuario: `@{username or 'Sin usuario'}`")
+        await message.reply_text(f"❌ No estás autorizado para subir videos. Pide acceso al administrador indicando tu ID numérico: `{user_id}` o tu usuario: `@{username or 'Sin usuario'}`")
         return
 
     # Extraer información del archivo (ya sea video o documento como MP4)
@@ -155,7 +170,7 @@ async def handle_video(client: Client, message: Message):
     file_name = file.file_name if getattr(file, 'file_name', None) else f"video_{message.id}.mp4"
     
     # Mensaje de estado
-    status_msg = await message.reply_text(f"⏳ Descargando `{file_name}` ({file_size_mb:.2f} MB)...")
+    status_msg = await message.reply_text(f"¡Hola {user_name}! ⏳ Descargando `{file_name}` ({file_size_mb:.2f} MB)...")
     
     try:
         # 1. Descargar archivo
@@ -242,20 +257,22 @@ def index():
 @requires_auth
 def add_user():
     user_id = request.form.get('user_id')
+    user_name = request.form.get('user_name')
     ftp_path = request.form.get('ftp_path')
-    if user_id and ftp_path:
+    if user_id and ftp_path and user_name:
         user_id = str(user_id).strip()
+        user_name = str(user_name).strip()
         ftp_path = str(ftp_path).strip()
         users = load_users()
         
         if user_id not in users:
-            users[user_id] = ftp_path
+            users[user_id] = {"ftp_path": ftp_path, "name": user_name}
             save_users(users)
-            flash(f"Usuario {user_id} autorizado para usar la carpeta /{ftp_path}.", "success")
+            flash(f"Usuario {user_id} ({user_name}) autorizado para usar la carpeta /{ftp_path}.", "success")
         else:
-            flash("El usuario ya estaba autorizado. Revócalo primero si deseas cambiar su carpeta.", "error")
+            flash("El usuario ya estaba autorizado. Revócalo primero si deseas cambiar sus datos.", "error")
     else:
-        flash("Datos inválidos.", "error")
+        flash("Datos inválidos. Completa todos los campos.", "error")
     return redirect(url_for('index'))
 
 @flask_app.route('/delete', methods=['POST'])
