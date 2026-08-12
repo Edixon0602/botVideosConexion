@@ -182,7 +182,7 @@ async def control_vdo_panel(action_url: str) -> bool:
 async def start(client: Client, message: Message):
     await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
 
-@app.on_message(filters.command("iniciar_stream"))
+@app.on_message(filters.command("iniciar"))
 async def cmd_start_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
@@ -199,7 +199,7 @@ async def cmd_start_stream(client: Client, message: Message):
     else:
         await msg.edit_text("❌ Error al iniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
 
-@app.on_message(filters.command("detener_stream"))
+@app.on_message(filters.command("detener"))
 async def cmd_stop_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
