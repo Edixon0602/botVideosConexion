@@ -148,7 +148,7 @@ async def control_vdo_panel(action_url: str) -> bool:
             soup = BeautifulSoup(html, 'html.parser')
             
             payload = {
-                "username": vdo_user,
+                "name": vdo_user,
                 "password": vdo_pass
             }
             
@@ -163,8 +163,8 @@ async def control_vdo_panel(action_url: str) -> bool:
             async with session.post(login_url, data=payload) as resp:
                 # Laravel suele redirigir (302) si el login fue exitoso. 
                 # aiohttp sigue las redirecciones por defecto, por lo que debería darnos un 200 en el dashboard
-                if resp.status not in [200, 302]:
-                    logger.error(f"Fallo al loguear en VDO Panel: {resp.status}")
+                if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
+                    logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False
                 
             # 3. Ejecutar la acción solicitada (start o stop)
