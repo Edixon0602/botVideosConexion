@@ -6,6 +6,8 @@ import asyncio
 import threading
 import urllib.request
 import time
+import aiohttp
+from bs4 import BeautifulSoup
 
 # Parche para Render y Python 3.10+ (corrige el error de 'no current event loop')
 try:
@@ -126,9 +128,93 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
     ftp.quit()
     logger.info("Subida FTP completada.")
 
+async def control_vdo_panel(action_url: str) -> bool:
+    vdo_user = os.getenv("VDOPANEL_USER")
+    vdo_pass = os.getenv("VDOPANEL_PASS")
+    
+    if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
+        logger.error("Credenciales de VDO Panel no configuradas.")
+        return False
+        
+    login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    
+    try:
+        # Usamos una sesión para guardar las cookies automáticamente
+        async with aiohttp.ClientSession() as session:
+            # 1. Obtener la página de login para sacar el CSRF token y cookies iniciales
+            async with session.get(login_url) as resp:
+                html = await resp.text()
+                
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            payload = {
+                "username": vdo_user,
+                "password": vdo_pass
+            }
+            
+            # Extraer campos ocultos (como _token de Laravel)
+            for hidden in soup.find_all("input", type="hidden"):
+                name = hidden.get("name")
+                value = hidden.get("value")
+                if name:
+                    payload[name] = value
+                    
+            # 2. Hacer POST al login
+            async with session.post(login_url, data=payload) as resp:
+                # Laravel suele redirigir (302) si el login fue exitoso. 
+                # aiohttp sigue las redirecciones por defecto, por lo que debería darnos un 200 en el dashboard
+                if resp.status not in [200, 302]:
+                    logger.error(f"Fallo al loguear en VDO Panel: {resp.status}")
+                    return False
+                
+            # 3. Ejecutar la acción solicitada (start o stop)
+            async with session.get(action_url) as resp:
+                if resp.status in [200, 302, 301]:
+                    return True
+                else:
+                    logger.error(f"Fallo al ejecutar la acción en VDO Panel: HTTP {resp.status}")
+                    return False
+    except Exception as e:
+        logger.error(f"Excepción en control_vdo_panel: {e}")
+        return False
+
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
+
+@app.on_message(filters.command("iniciar_stream"))
+async def cmd_start_stream(client: Client, message: Message):
+    user_id = str(message.from_user.id)
+    allowed_users = load_users()
+    
+    if user_id not in allowed_users:
+        await message.reply_text("❌ No estás autorizado para controlar el stream.")
+        return
+        
+    msg = await message.reply_text("⏳ Intentando **INICIAR** el stream en VDO Panel...")
+    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-webtv")
+    
+    if success:
+        await msg.edit_text("✅ Stream **INICIADO** exitosamente.")
+    else:
+        await msg.edit_text("❌ Error al iniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+
+@app.on_message(filters.command("detener_stream"))
+async def cmd_stop_stream(client: Client, message: Message):
+    user_id = str(message.from_user.id)
+    allowed_users = load_users()
+    
+    if user_id not in allowed_users:
+        await message.reply_text("❌ No estás autorizado para controlar el stream.")
+        return
+        
+    msg = await message.reply_text("⏳ Intentando **DETENER** el stream en VDO Panel...")
+    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-webtv")
+    
+    if success:
+        await msg.edit_text("✅ Stream **DETENIDO** exitosamente.")
+    else:
+        await msg.edit_text("❌ Error al detener el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
 
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):

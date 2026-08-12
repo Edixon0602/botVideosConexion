@@ -2,3 +2,5 @@ pyrogram
 TgCrypto
 python-dotenv
 flask
+aiohttp
+beautifulsoup4
