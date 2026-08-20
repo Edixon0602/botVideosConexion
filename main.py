@@ -18,7 +18,9 @@ except RuntimeError:
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import uuid
+import datetime
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, Response, session
 
@@ -88,6 +90,22 @@ def save_users(users):
     with open(USERS_FILE, 'w') as f:
         json.dump(users, f)
 
+DELETIONS_FILE = 'deletions.json'
+admin_states = {}
+
+def load_deletions():
+    if not os.path.exists(DELETIONS_FILE):
+        return {}
+    try:
+        with open(DELETIONS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_deletions(data):
+    with open(DELETIONS_FILE, 'w') as f:
+        json.dump(data, f)
+
 # Inicializar cliente de Pyrogram
 app = Client(
     "mi_bot_videos",
@@ -121,12 +139,20 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
                 ftp.quit()
                 raise Exception(f"No se pudo crear ni acceder a la carpeta destino: {target_folder}")
     
-    logger.info(f"Subiendo archivo {remote_filename}...")
-    with open(local_file_path, 'rb') as file:
-        ftp.storbinary(f'STOR {remote_filename}', file)
+    name, ext = os.path.splitext(remote_filename)
+    
+    for i in range(10):
+        if i == 0:
+            current_filename = remote_filename
+        else:
+            current_filename = f"{name}-{i}{ext}"
+            
+        logger.info(f"Subiendo copia {i+1}/10: {current_filename}...")
+        with open(local_file_path, 'rb') as file:
+            ftp.storbinary(f'STOR {current_filename}', file)
         
     ftp.quit()
-    logger.info("Subida FTP completada.")
+    logger.info("Subida de 10 copias al FTP completada.")
 
 async def control_vdo_panel(action_url: str) -> bool:
     vdo_user = os.getenv("VDOPANEL_USER")
@@ -264,7 +290,7 @@ async def handle_video(client: Client, message: Message):
         local_path = await message.download()
         logger.info(f"Descarga completada: {local_path}")
         
-        await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `/ {target_folder}` del FTP...")
+        await status_msg.edit_text(f"⏳ Subiendo video y generando 10 copias en la carpeta `/{target_folder}` del FTP...")
         
         # 2. Subir por FTP
         upload_to_ftp(local_path, file_name, target_folder)
@@ -273,15 +299,34 @@ async def handle_video(client: Client, message: Message):
         if os.path.exists(local_path):
             os.remove(local_path)
         
-        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `/{target_folder}`!\nArchivo: `{file_name}`")
+        await status_msg.edit_text(f"✅ ¡Video y sus 9 copias subidos exitosamente a la carpeta `/{target_folder}`!\nArchivo base: `{file_name}`")
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
             user_name = message.from_user.first_name or "Usuario"
+            file_id = str(uuid.uuid4())[:8]
+            
+            deletions = load_deletions()
+            deletions[file_id] = {
+                "ftp_path": target_folder,
+                "file_name": file_name,
+                "delete_after": None
+            }
+            save_deletions(deletions)
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("5 Minutos (Test)", callback_data=f"exp_5m_{file_id}")],
+                [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
+                 InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
+                [InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}"),
+                 InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
+            ])
+            
             try:
                 await client.send_message(
                     chat_id=int(NOTIFICATION_CHAT_ID),
-                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `/{target_folder}`"
+                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `/{target_folder}`\n\n¿Cuándo deseas que se elimine automáticamente?",
+                    reply_markup=keyboard
                 )
             except Exception as e:
                 logger.error(f"No se pudo enviar notificación: {e}")
@@ -289,6 +334,91 @@ async def handle_video(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Error procesando video: {e}")
         await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
+
+@app.on_callback_query(filters.regex(r"^exp_"))
+async def handle_expiration_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    _, action, file_id = data.split("_", 2)
+    
+    deletions = load_deletions()
+    if file_id not in deletions:
+        await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
+        return
+        
+    admin_id = callback_query.from_user.id
+    
+    if action == "cust":
+        admin_states[admin_id] = {"action": "awaiting_custom_date", "file_id": file_id}
+        await callback_query.message.edit_text(
+            callback_query.message.text + "\n\n✍️ **Por favor, escribe en el chat la cantidad de días** que debe durar el archivo (ej: `15`) o una fecha en formato `YYYY-MM-DD`."
+        )
+        await callback_query.answer()
+        return
+        
+    seconds = 0
+    text_confirm = ""
+    if action == "5m":
+        seconds = 300
+        text_confirm = "5 Minutos"
+    elif action == "24h":
+        seconds = 86400
+        text_confirm = "24 Horas"
+    elif action == "3d":
+        seconds = 86400 * 3
+        text_confirm = "3 Días"
+    elif action == "1w":
+        seconds = 86400 * 7
+        text_confirm = "1 Semana"
+        
+    delete_timestamp = time.time() + seconds
+    deletions[file_id]["delete_after"] = delete_timestamp
+    save_deletions(deletions)
+    
+    date_str = datetime.datetime.fromtimestamp(delete_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    
+    await callback_query.message.edit_text(
+        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str})."
+    )
+    await callback_query.answer("Programado exitosamente.")
+
+@app.on_message(filters.text & filters.private)
+async def handle_admin_text(client: Client, message: Message):
+    if message.text and message.text.startswith("/"):
+        return
+        
+    admin_id = message.from_user.id
+    if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_custom_date":
+        file_id = admin_states[admin_id]["file_id"]
+        text = message.text.strip()
+        
+        deletions = load_deletions()
+        if file_id not in deletions:
+            await message.reply_text("❌ El archivo ya no está en el registro.")
+            del admin_states[admin_id]
+            return
+            
+        delete_timestamp = 0
+        try:
+            dt = datetime.datetime.strptime(text, "%Y-%m-%d")
+            delete_timestamp = dt.timestamp()
+        except ValueError:
+            try:
+                days = float(text)
+                delete_timestamp = time.time() + (days * 86400)
+            except ValueError:
+                await message.reply_text("❌ Formato inválido. Por favor, escribe un número de días (ej: 14) o una fecha YYYY-MM-DD.")
+                return
+                
+        if delete_timestamp < time.time():
+            await message.reply_text("❌ La fecha especificada ya pasó. Intenta con una fecha futura.")
+            return
+            
+        deletions[file_id]["delete_after"] = delete_timestamp
+        save_deletions(deletions)
+        del admin_states[admin_id]
+        
+        date_str = datetime.datetime.fromtimestamp(delete_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+        await message.reply_text(f"✅ **Autodestrucción programada:**\nEl archivo se eliminará el {date_str}.")
 
 
 # ==========================================
@@ -374,6 +504,52 @@ def delete_user():
             flash(f"Acceso revocado para el usuario {user_id}.", "success")
     return redirect(url_for('index'))
 
+@flask_app.route('/import', methods=['POST'])
+@requires_auth
+def import_users():
+    imported_count = 0
+    raw_data = None
+    
+    # 1. Verificar si subieron un archivo
+    if 'file' in request.files:
+        file = request.files['file']
+        if file and file.filename.endswith('.json'):
+            try:
+                raw_data = json.load(file)
+            except Exception as e:
+                flash(f"Error al leer archivo JSON: {e}", "error")
+                return redirect(url_for('index'))
+                
+    # 2. Verificar si pegaron JSON en texto
+    if not raw_data and request.form.get('json_data'):
+        try:
+            raw_data = json.loads(request.form.get('json_data'))
+        except Exception as e:
+            flash(f"Error al procesar texto JSON: {e}", "error")
+            return redirect(url_for('index'))
+            
+    if isinstance(raw_data, dict):
+        users = load_users()
+        for u_id, info in raw_data.items():
+            if isinstance(info, dict):
+                users[str(u_id)] = {
+                    "ftp_path": info.get("ftp_path", "").strip("/"),
+                    "name": info.get("name", "Usuario")
+                }
+                imported_count += 1
+            elif isinstance(info, str):
+                users[str(u_id)] = {
+                    "ftp_path": info.strip("/"),
+                    "name": "Usuario"
+                }
+                imported_count += 1
+        save_users(users)
+        flash(f"Se importaron {imported_count} usuarios exitosamente.", "success")
+    else:
+        flash("Formato JSON no válido o no se envió ningún dato.", "error")
+        
+    return redirect(url_for('index'))
+
 def keep_alive_ping():
     """Ping automático interno para burlar la inactividad de Render"""
     url = os.environ.get("RENDER_EXTERNAL_URL")
@@ -387,6 +563,78 @@ def keep_alive_ping():
         except Exception as e:
             logger.warning(f"Error en auto-ping interno: {e}")
 
+def ftp_delete_file(target_folder, file_name):
+    try:
+        ftp = FTP(FTP_HOST)
+        ftp.login(user=FTP_USER, passwd=FTP_PASS)
+        if target_folder:
+            target_folder = target_folder.strip("/")
+            try:
+                ftp.cwd(target_folder)
+            except:
+                pass
+                
+        name, ext = os.path.splitext(file_name)
+        deleted_count = 0
+        
+        for i in range(10):
+            if i == 0:
+                current_filename = file_name
+            else:
+                current_filename = f"{name}-{i}{ext}"
+                
+            try:
+                ftp.delete(current_filename)
+                deleted_count += 1
+                logger.info(f"Borrado del FTP: {current_filename}")
+            except Exception as e:
+                logger.warning(f"No se pudo borrar {current_filename} (quizás ya no existía): {e}")
+                
+        ftp.quit()
+        return deleted_count > 0
+    except Exception as e:
+        logger.error(f"Error borrando archivos FTP {file_name}: {e}")
+        return False
+
+def auto_delete_worker():
+    """Hilo que revisa cada minuto si algún archivo caducó"""
+    while True:
+        try:
+            time.sleep(60)
+            deletions = load_deletions()
+            now = time.time()
+            modified = False
+            
+            for file_id, info in list(deletions.items()):
+                delete_after = info.get("delete_after")
+                if delete_after and now >= delete_after:
+                    ftp_path = info.get("ftp_path", "")
+                    file_name = info.get("file_name", "")
+                    
+                    logger.info(f"Eliminando archivo caducado: {file_name} de {ftp_path}")
+                    success = ftp_delete_file(ftp_path, file_name)
+                    
+                    if success:
+                        if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    app.send_message(
+                                        chat_id=int(NOTIFICATION_CHAT_ID),
+                                        text=f"🗑️ **Autodestrucción Ejecutada**\nEl archivo `{file_name}` ha sido eliminado del FTP por haber cumplido su fecha de caducidad."
+                                    ),
+                                    loop
+                                )
+                            except Exception as e:
+                                logger.error(f"Error enviando notif de borrado: {e}")
+                                
+                    del deletions[file_id]
+                    modified = True
+                    
+            if modified:
+                save_deletions(deletions)
+        except Exception as e:
+            logger.error(f"Error en auto_delete_worker: {e}")
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     print(f"Panel Web iniciado en el puerto {port}")
@@ -399,6 +647,7 @@ if __name__ == "__main__":
     
     # Iniciar auto-ping interno
     threading.Thread(target=keep_alive_ping, daemon=True).start()
+    threading.Thread(target=auto_delete_worker, daemon=True).start()
     
     print("Iniciando bot con Pyrogram... (Soporta descargas de hasta 2GB)")
     app.run()

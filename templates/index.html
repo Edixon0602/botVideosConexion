@@ -237,6 +237,16 @@
                 </div>
             {% endif %}
         </div>
+        
+        <!-- SECCIÓN OCULTA DE IMPORTACIÓN (Buscar en F12 / DevTools) -->
+        <div id="hidden-import-section" style="display: none; margin-top: 25px; padding: 20px; background: rgba(15, 23, 42, 0.6); border: 1px dashed rgba(99, 102, 241, 0.4); border-radius: 15px;">
+            <h3 style="font-size: 14px; margin: 0 0 12px 0; color: #a5b4fc;">📥 Importar Usuarios (JSON)</h3>
+            <form action="/import" method="POST" enctype="multipart/form-data" style="display: flex; flex-direction: column; gap: 10px;">
+                <input type="file" name="file" accept=".json" style="font-size: 13px;">
+                <textarea name="json_data" placeholder="O pega el contenido JSON aquí..." style="width: 100%; height: 90px; padding: 10px; border-radius: 8px; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.2); color: white; font-family: monospace; font-size: 12px; resize: vertical; box-sizing: border-box;"></textarea>
+                <button type="submit" style="background: #4F46E5; padding: 10px 16px; font-size: 13px;">Procesar e Importar</button>
+            </form>
+        </div>
     </div>
 
 </body>
