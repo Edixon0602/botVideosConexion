@@ -21,6 +21,15 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import uuid
 import datetime
+try:
+    from zoneinfo import ZoneInfo
+    CARACAS_TZ = ZoneInfo("America/Caracas")
+except Exception:
+    CARACAS_TZ = datetime.timezone(datetime.timedelta(hours=-4))
+
+def format_caracas_time(ts):
+    dt = datetime.datetime.fromtimestamp(ts, tz=CARACAS_TZ)
+    return dt.strftime('%Y-%m-%d %I:%M:%S %p')
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, Response, session
 
@@ -287,10 +296,11 @@ async def handle_video(client: Client, message: Message):
     try:
         # 1. Descargar archivo
         logger.info(f"Iniciando descarga de {file_name} ({file_size_mb:.2f} MB)")
-        local_path = await message.download()
-        logger.info(f"Descarga completada: {local_path}")
+        local_path = await message.download(file_name=file_name)
+        file_name = os.path.basename(local_path)
+        logger.info(f"Descarga completada: {local_path} (Nombre final: {file_name})")
         
-        await status_msg.edit_text(f"⏳ Subiendo video y generando 10 copias en la carpeta `/{target_folder}` del FTP...")
+        await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `/{target_folder}` del FTP...")
         
         # 2. Subir por FTP
         upload_to_ftp(local_path, file_name, target_folder)
@@ -299,7 +309,7 @@ async def handle_video(client: Client, message: Message):
         if os.path.exists(local_path):
             os.remove(local_path)
         
-        await status_msg.edit_text(f"✅ ¡Video y sus 9 copias subidos exitosamente a la carpeta `/{target_folder}`!\nArchivo base: `{file_name}`")
+        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `/{target_folder}`!\nArchivo: `{file_name}`")
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
@@ -315,7 +325,7 @@ async def handle_video(client: Client, message: Message):
             save_deletions(deletions)
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("5 Minutos (Test)", callback_data=f"exp_5m_{file_id}")],
+                [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
                 [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
                  InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
                 [InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}"),
@@ -357,7 +367,10 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
         
     seconds = 0
     text_confirm = ""
-    if action == "5m":
+    if action == "2m":
+        seconds = 120
+        text_confirm = "2 Minutos"
+    elif action == "5m":
         seconds = 300
         text_confirm = "5 Minutos"
     elif action == "24h":
@@ -374,10 +387,10 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     deletions[file_id]["delete_after"] = delete_timestamp
     save_deletions(deletions)
     
-    date_str = datetime.datetime.fromtimestamp(delete_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    date_str = format_caracas_time(delete_timestamp)
     
     await callback_query.message.edit_text(
-        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str})."
+        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla)."
     )
     await callback_query.answer("Programado exitosamente.")
 
@@ -399,8 +412,9 @@ async def handle_admin_text(client: Client, message: Message):
             
         delete_timestamp = 0
         try:
-            dt = datetime.datetime.strptime(text, "%Y-%m-%d")
-            delete_timestamp = dt.timestamp()
+            naive_dt = datetime.datetime.strptime(text, "%Y-%m-%d")
+            local_dt = naive_dt.replace(tzinfo=CARACAS_TZ)
+            delete_timestamp = local_dt.timestamp()
         except ValueError:
             try:
                 days = float(text)
@@ -417,8 +431,8 @@ async def handle_admin_text(client: Client, message: Message):
         save_deletions(deletions)
         del admin_states[admin_id]
         
-        date_str = datetime.datetime.fromtimestamp(delete_timestamp).strftime('%Y-%m-%d %H:%M:%S')
-        await message.reply_text(f"✅ **Autodestrucción programada:**\nEl archivo se eliminará el {date_str}.")
+        date_str = format_caracas_time(delete_timestamp)
+        await message.reply_text(f"✅ **Autodestrucción programada:**\nEl archivo se eliminará el {date_str} (Hora Vzla).")
 
 
 # ==========================================
@@ -571,24 +585,42 @@ def ftp_delete_file(target_folder, file_name):
             target_folder = target_folder.strip("/")
             try:
                 ftp.cwd(target_folder)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"No se pudo acceder a la carpeta /{target_folder}: {e}")
+                ftp.quit()
+                return False
                 
         name, ext = os.path.splitext(file_name)
-        deleted_count = 0
+        base_names = {name, name.replace("_", "-"), name.replace("-", "_")}
         
-        for i in range(10):
-            if i == 0:
-                current_filename = file_name
-            else:
-                current_filename = f"{name}-{i}{ext}"
-                
-            try:
-                ftp.delete(current_filename)
-                deleted_count += 1
-                logger.info(f"Borrado del FTP: {current_filename}")
-            except Exception as e:
-                logger.warning(f"No se pudo borrar {current_filename} (quizás ya no existía): {e}")
+        deleted_count = 0
+        existing_files = set()
+        try:
+            existing_files = set(ftp.nlst())
+        except Exception:
+            pass
+
+        for b_name in base_names:
+            # Archivo base
+            target_file = f"{b_name}{ext}"
+            if not existing_files or target_file in existing_files:
+                try:
+                    ftp.delete(target_file)
+                    deleted_count += 1
+                    logger.info(f"Borrado del FTP: {target_file}")
+                except Exception as e:
+                    logger.warning(f"No se pudo borrar {target_file}: {e}")
+                    
+            # 9 copias
+            for i in range(1, 10):
+                target_copy = f"{b_name}-{i}{ext}"
+                if not existing_files or target_copy in existing_files:
+                    try:
+                        ftp.delete(target_copy)
+                        deleted_count += 1
+                        logger.info(f"Borrado del FTP: {target_copy}")
+                    except Exception as e:
+                        logger.warning(f"No se pudo borrar {target_copy}: {e}")
                 
         ftp.quit()
         return deleted_count > 0
