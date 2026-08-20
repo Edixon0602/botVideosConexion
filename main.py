@@ -300,7 +300,8 @@ async def handle_video(client: Client, message: Message):
         file_name = os.path.basename(local_path)
         logger.info(f"Descarga completada: {local_path} (Nombre final: {file_name})")
         
-        await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `/{target_folder}` del FTP...")
+        folder_display = target_folder if target_folder.startswith("/") else f"/{target_folder}"
+        await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `{folder_display}` del FTP...")
         
         # 2. Subir por FTP
         upload_to_ftp(local_path, file_name, target_folder)
@@ -309,7 +310,7 @@ async def handle_video(client: Client, message: Message):
         if os.path.exists(local_path):
             os.remove(local_path)
         
-        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `/{target_folder}`!\nArchivo: `{file_name}`")
+        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `{folder_display}`!\nArchivo: `{file_name}`")
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
@@ -335,7 +336,7 @@ async def handle_video(client: Client, message: Message):
             try:
                 await client.send_message(
                     chat_id=int(NOTIFICATION_CHAT_ID),
-                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `/{target_folder}`\n\n¿Cuándo deseas que se elimine automáticamente?",
+                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `{folder_display}`\n\n¿Cuándo deseas que se elimine automáticamente?",
                     reply_markup=keyboard
                 )
             except Exception as e:
@@ -493,12 +494,15 @@ def add_user():
         user_id = str(user_id).strip()
         user_name = str(user_name).strip()
         ftp_path = str(ftp_path).strip()
+        if not ftp_path.startswith("/"):
+            ftp_path = f"/{ftp_path}"
+            
         users = load_users()
         
         if user_id not in users:
             users[user_id] = {"ftp_path": ftp_path, "name": user_name}
             save_users(users)
-            flash(f"Usuario {user_id} ({user_name}) autorizado para usar la carpeta /{ftp_path}.", "success")
+            flash(f"Usuario {user_id} ({user_name}) autorizado para usar la carpeta {ftp_path}.", "success")
         else:
             flash("El usuario ya estaba autorizado. Revócalo primero si deseas cambiar sus datos.", "error")
     else:
@@ -545,18 +549,23 @@ def import_users():
     if isinstance(raw_data, dict):
         users = load_users()
         for u_id, info in raw_data.items():
+            path_val = ""
+            name_val = "Usuario"
             if isinstance(info, dict):
-                users[str(u_id)] = {
-                    "ftp_path": info.get("ftp_path", "").strip("/"),
-                    "name": info.get("name", "Usuario")
-                }
-                imported_count += 1
+                path_val = str(info.get("ftp_path", "")).strip()
+                name_val = info.get("name", "Usuario")
             elif isinstance(info, str):
-                users[str(u_id)] = {
-                    "ftp_path": info.strip("/"),
-                    "name": "Usuario"
-                }
-                imported_count += 1
+                path_val = str(info).strip()
+                
+            if path_val and not path_val.startswith("/"):
+                path_val = f"/{path_val}"
+                
+            users[str(u_id)] = {
+                "ftp_path": path_val,
+                "name": name_val
+            }
+            imported_count += 1
+            
         save_users(users)
         flash(f"Se importaron {imported_count} usuarios exitosamente.", "success")
     else:
