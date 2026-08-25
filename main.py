@@ -18,6 +18,7 @@ except RuntimeError:
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import uuid
 import datetime
@@ -303,14 +304,17 @@ async def handle_video(client: Client, message: Message):
         folder_display = target_folder if target_folder.startswith("/") else f"/{target_folder}"
         await status_msg.edit_text(f"⏳ Subiendo video a la carpeta `{folder_display}` del FTP...")
         
-        # 2. Subir por FTP
-        upload_to_ftp(local_path, file_name, target_folder)
+        # 2. Subir por FTP en un hilo separado para no bloquear el event loop de Telegram
+        await asyncio.to_thread(upload_to_ftp, local_path, file_name, target_folder)
         
         # 3. Eliminar archivo temporal local
         if os.path.exists(local_path):
             os.remove(local_path)
         
-        await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `{folder_display}`!\nArchivo: `{file_name}`")
+        try:
+            await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `{folder_display}`!\nArchivo: `{file_name}`")
+        except MessageNotModified:
+            pass
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
@@ -342,9 +346,14 @@ async def handle_video(client: Client, message: Message):
             except Exception as e:
                 logger.error(f"No se pudo enviar notificación: {e}")
         
+    except MessageNotModified:
+        pass
     except Exception as e:
         logger.error(f"Error procesando video: {e}")
-        await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
+        try:
+            await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
+        except Exception:
+            pass
 
 @app.on_callback_query(filters.regex(r"^exp_"))
 async def handle_expiration_callback(client: Client, callback_query: CallbackQuery):
