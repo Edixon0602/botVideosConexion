@@ -214,6 +214,101 @@ async def control_vdo_panel(action_url: str) -> bool:
         logger.error(f"Excepción en control_vdo_panel: {e}")
         return False
 
+async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None) -> bool:
+    vdo_user = os.getenv("VDOPANEL_USER")
+    vdo_pass = os.getenv("VDOPANEL_PASS")
+    
+    if playlist_id is None:
+        try:
+            playlist_id = int(os.getenv("VDOPANEL_PLAYLIST_ID", "3"))
+        except ValueError:
+            playlist_id = 3
+            
+    if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
+        logger.error("Credenciales de VDO Panel no configuradas.")
+        return False
+        
+    login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    batch_url = "https://stream.conexion.com.ve/broadcaster/filemanager/batch"
+    add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Obtener la página de login para sacar el CSRF token y cookies iniciales
+            async with session.get(login_url) as resp:
+                html = await resp.text()
+                
+            soup = BeautifulSoup(html, 'html.parser')
+            payload = {
+                "name": vdo_user,
+                "password": vdo_pass
+            }
+            
+            for hidden in soup.find_all("input", type="hidden"):
+                name = hidden.get("name")
+                value = hidden.get("value")
+                if name:
+                    payload[name] = value
+                    
+            # 2. Hacer POST al login
+            async with session.post(login_url, data=payload) as resp:
+                if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
+                    logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
+                    return False
+                    
+            # 3. Obtener el CSRF token post-login
+            token = None
+            async with session.get(batch_url) as resp:
+                if resp.status in [200, 302]:
+                    batch_html = await resp.text()
+                    batch_soup = BeautifulSoup(batch_html, 'html.parser')
+                    for hidden in batch_soup.find_all("input", type="hidden"):
+                        if hidden.get("name") == "_token":
+                            token = hidden.get("value")
+                            break
+                            
+            if not token:
+                for cookie in session.cookie_jar:
+                    if cookie.key == "XSRF-TOKEN":
+                        token = cookie.value
+                        break
+                        
+            if not token:
+                logger.error("No se pudo obtener el CSRF token para agregar a la playlist.")
+                return False
+                
+            # 4. Generar lista de los 10 archivos
+            name, ext = os.path.splitext(file_name)
+            folder_clean = target_folder.strip("/") if target_folder else ""
+            
+            file_entries = []
+            for i in range(10):
+                curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
+                rel_path = f"{folder_clean}/{curr_name}" if folder_clean else curr_name
+                file_entries.append(('file[]', rel_path))
+                
+            post_data = [
+                ('_token', token),
+                ('playlist', str(playlist_id))
+            ] + file_entries
+            
+            headers = {
+                "Referer": batch_url,
+                "Origin": "https://stream.conexion.com.ve"
+            }
+            
+            logger.info(f"Agregando {len(file_entries)} archivos a la playlist {playlist_id} en VDO Panel...")
+            async with session.post(add_url, data=post_data, headers=headers) as resp:
+                if resp.status in [200, 302, 301]:
+                    logger.info(f"Archivos agregados exitosamente a la playlist {playlist_id}.")
+                    return True
+                else:
+                    logger.error(f"Fallo al agregar a playlist en VDO Panel: HTTP {resp.status}")
+                    return False
+    except Exception as e:
+        logger.error(f"Excepción en add_files_to_vdo_playlist: {e}")
+        return False
+
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
@@ -330,6 +425,7 @@ async def handle_video(client: Client, message: Message):
             save_deletions(deletions)
             
             keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
                 [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
                 [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
                  InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
@@ -354,6 +450,55 @@ async def handle_video(client: Client, message: Message):
             await status_msg.edit_text(f"❌ Ocurrió un error al procesar el video:\n`{str(e)}`")
         except Exception:
             pass
+
+@app.on_callback_query(filters.regex(r"^addpl_"))
+async def handle_add_playlist_callback(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    _, file_id = data.split("_", 1)
+    
+    deletions = load_deletions()
+    if file_id not in deletions:
+        await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
+        return
+        
+    info = deletions[file_id]
+    target_folder = info.get("ftp_path", "")
+    file_name = info.get("file_name", "")
+    
+    await callback_query.answer("⏳ Agregando las 10 copias a la Lista Musical...", show_alert=False)
+    
+    success = await add_files_to_vdo_playlist(target_folder, file_name)
+    
+    if success:
+        deletions[file_id]["playlist_added"] = True
+        save_deletions(deletions)
+        
+        current_markup = callback_query.message.reply_markup
+        new_rows = []
+        if current_markup and current_markup.inline_keyboard:
+            for row in current_markup.inline_keyboard:
+                new_row = []
+                for btn in row:
+                    if btn.callback_data and btn.callback_data.startswith("addpl_"):
+                        new_row.append(InlineKeyboardButton("✅ Agregado a Lista Musical", callback_data=f"noop_{file_id}"))
+                    else:
+                        new_row.append(btn)
+                new_rows.append(new_row)
+        else:
+            new_rows = [[InlineKeyboardButton("✅ Agregado a Lista Musical", callback_data=f"noop_{file_id}")]]
+            
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
+        except Exception:
+            pass
+            
+        await callback_query.message.reply_text(f"🎵 ✅ **10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
+    else:
+        await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
+
+@app.on_callback_query(filters.regex(r"^noop_"))
+async def handle_noop_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer("Este archivo ya fue agregado a la lista musical.", show_alert=True)
 
 @app.on_callback_query(filters.regex(r"^exp_"))
 async def handle_expiration_callback(client: Client, callback_query: CallbackQuery):
@@ -399,8 +544,12 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     
     date_str = format_caracas_time(delete_timestamp)
     
+    is_added = deletions[file_id].get("playlist_added", False)
+    pl_btn = InlineKeyboardButton("✅ Agregado a Lista Musical" if is_added else "🎵 Agregar a Lista Musical", callback_data=f"noop_{file_id}" if is_added else f"addpl_{file_id}")
+    
     await callback_query.message.edit_text(
-        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla)."
+        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
+        reply_markup=InlineKeyboardMarkup([[pl_btn]])
     )
     await callback_query.answer("Programado exitosamente.")
 
