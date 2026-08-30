@@ -267,14 +267,19 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False, 0
                     
-            # 2. GET filemanager para obtener el token CSRF inicial
+            # 2. GET filemanager para obtener el token CSRF y los archivos reales del servidor
             fm_token = None
+            existing_fm_files = set()
             async with session.get(fm_url) as resp:
                 if resp.status == 200:
                     s = BeautifulSoup(await resp.text(), 'html.parser')
                     inp = s.find('input', {'name': '_token'})
                     if inp:
                         fm_token = inp.get('value')
+                    for f_inp in s.find_all('input', {'name': 'file[]'}):
+                        val = f_inp.get('value')
+                        if val:
+                            existing_fm_files.add(val)
                         
             if not fm_token:
                 for cookie in session.cookie_jar:
@@ -286,6 +291,35 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 logger.error("No se pudo obtener el CSRF token de Filemanager.")
                 return False, 0
                 
+            # Resolver inteligentemente los 10 nombres exactos presentes en el FileManager
+            resolved_files = []
+            for i in range(10):
+                if i == 0:
+                    candidates = [
+                        file_name,
+                        file_name.replace("_", "-"),
+                        file_name.replace("-", "_"),
+                        file_name.replace(" ", "-"),
+                        file_name.replace(" ", "_")
+                    ]
+                else:
+                    candidates = [
+                        f"{name}-{i}{ext}",
+                        f"{name.replace('_', '-')}-{i}{ext}",
+                        f"{name.replace('-', '_')}-{i}{ext}",
+                        f"{name}_{i}{ext}",
+                        f"{name.replace('_', '-')}_{i}{ext}"
+                    ]
+                
+                chosen = None
+                for c in candidates:
+                    if c in existing_fm_files:
+                        chosen = c
+                        break
+                if not chosen:
+                    chosen = candidates[0]
+                resolved_files.append(chosen)
+                
             # 3. POST a filemanager/batch (Paso 1 del batch)
             root_path = f"/home/{vdo_user}/uploads/{folder_clean}" if folder_clean else f"/home/{vdo_user}/uploads"
             batch_post_data = [
@@ -294,7 +328,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 ('batch_action', 'playlist'),
                 ('FM_ROOT_PATH', root_path)
             ]
-            for f in file_list:
+            for f in resolved_files:
                 batch_post_data.append(('file[]', f))
                 
             headers_step1 = {
@@ -306,7 +340,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             step2_token = fm_token
             step2_files = []
             
-            logger.info(f"Enviando lote de 10 copias a {batch_url}...")
+            logger.info(f"Enviando lote de 10 copias a {batch_url} (Archivos: {resolved_files})...")
             async with session.post(batch_url, data=batch_post_data, headers=headers_step1) as resp:
                 if resp.status in [200, 302]:
                     batch_html = await resp.text()
@@ -320,7 +354,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                                 step2_files.append(inp.get('value'))
                                 
             if not step2_files:
-                step2_files = [f"{folder_clean}/{f}" if folder_clean else f for f in file_list]
+                step2_files = [f"{folder_clean}/{f}" if folder_clean else f for f in resolved_files]
                 
             # 4. POST a addtoplaylistpost (Paso 2 del batch)
             post_add_data = [
