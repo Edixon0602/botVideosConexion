@@ -447,19 +447,10 @@ async def handle_video(client: Client, message: Message):
             target_folder = allowed_users[f"@{username}"].get("ftp_path", "")
             user_name = allowed_users[f"@{username}"].get("name", "Usuario")
             
-    # Si el usuario es el administrador configurado en NOTIFICATION_CHAT_ID
-    if not is_allowed and NOTIFICATION_CHAT_ID and user_id == str(NOTIFICATION_CHAT_ID):
-        is_allowed = True
-        target_folder = target_folder or FTP_UPLOAD_PATH or "avances-informativos"
-        user_name = user_name or message.from_user.first_name or "Administrador"
-
     if not is_allowed:
         logger.warning(f"Acceso denegado al usuario: {user_id} (@{username})")
         await message.reply_text(f"❌ No estás autorizado para subir videos. Pide acceso al administrador indicando tu ID numérico: `{user_id}` o tu usuario: `@{username or 'Sin usuario'}`")
         return
-
-    if not target_folder:
-        target_folder = FTP_UPLOAD_PATH or "avances-informativos"
 
     # Extraer información del archivo (ya sea video o documento como MP4)
     file = message.video or message.document
