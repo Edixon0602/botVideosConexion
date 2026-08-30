@@ -233,11 +233,20 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
         return False, 0
         
     login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    folder_clean = target_folder.strip("/") if target_folder else ""
+    fm_url = f"https://stream.conexion.com.ve/broadcaster/filemanager?p={folder_clean}"
+    batch_url = "https://stream.conexion.com.ve/broadcaster/filemanager/batch"
     add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
+    
+    name, ext = os.path.splitext(file_name)
+    file_list = []
+    for i in range(10):
+        curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
+        file_list.append(curr_name)
     
     try:
         async with aiohttp.ClientSession() as session:
-            # 1. Obtener la página de login para sacar el CSRF token y cookies iniciales
+            # 1. Login a VDO Panel
             async with session.get(login_url) as resp:
                 html = await resp.text()
                 
@@ -248,86 +257,94 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             }
             
             for hidden in soup.find_all("input", type="hidden"):
-                name = hidden.get("name")
-                value = hidden.get("value")
-                if name:
-                    payload[name] = value
+                name_attr = hidden.get("name")
+                val_attr = hidden.get("value")
+                if name_attr:
+                    payload[name_attr] = val_attr
                     
-            # 2. Hacer POST al login
             async with session.post(login_url, data=payload) as resp:
                 if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False, 0
                     
-            def get_xsrf_from_cookie():
+            # 2. GET filemanager para obtener el token CSRF inicial
+            fm_token = None
+            async with session.get(fm_url) as resp:
+                if resp.status == 200:
+                    s = BeautifulSoup(await resp.text(), 'html.parser')
+                    inp = s.find('input', {'name': '_token'})
+                    if inp:
+                        fm_token = inp.get('value')
+                        
+            if not fm_token:
                 for cookie in session.cookie_jar:
                     if cookie.key == "XSRF-TOKEN":
-                        return urllib.parse.unquote(cookie.value)
-                return None
-
-            async def fetch_fresh_form_token():
-                try:
-                    async with session.get("https://stream.conexion.com.ve/broadcaster/addtoplaylist?file=test") as r:
-                        if r.status == 200:
-                            s = BeautifulSoup(await r.text(), 'html.parser')
-                            inp = s.find('input', {'name': '_token'})
-                            if inp:
-                                return inp.get('value')
-                except Exception:
-                    pass
-                return get_xsrf_from_cookie()
-
-            token = await fetch_fresh_form_token()
-            if not token:
-                logger.error("No se pudo obtener el CSRF token para agregar a la playlist.")
+                        fm_token = urllib.parse.unquote(cookie.value)
+                        break
+                        
+            if not fm_token:
+                logger.error("No se pudo obtener el CSRF token de Filemanager.")
                 return False, 0
                 
-            # 4. Agregar individualmente cada una de las 10 copias
-            name, ext = os.path.splitext(file_name)
-            folder_clean = target_folder.strip("/") if target_folder else ""
+            # 3. POST a filemanager/batch (Paso 1 del batch)
+            root_path = f"/home/{vdo_user}/uploads/{folder_clean}" if folder_clean else f"/home/{vdo_user}/uploads"
+            batch_post_data = [
+                ('_token', fm_token),
+                ('p', folder_clean),
+                ('batch_action', 'playlist'),
+                ('FM_ROOT_PATH', root_path)
+            ]
+            for f in file_list:
+                batch_post_data.append(('file[]', f))
+                
+            headers_step1 = {
+                "Referer": fm_url,
+                "Origin": "https://stream.conexion.com.ve",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
             
-            added_count = 0
-            logger.info(f"Iniciando adición robusta de 10 copias a la playlist {playlist_id} en VDO Panel...")
-            for i in range(10):
-                curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
-                rel_path = f"{folder_clean}/{curr_name}" if folder_clean else curr_name
+            step2_token = fm_token
+            step2_files = []
+            
+            logger.info(f"Enviando lote de 10 copias a {batch_url}...")
+            async with session.post(batch_url, data=batch_post_data, headers=headers_step1) as resp:
+                if resp.status in [200, 302]:
+                    batch_html = await resp.text()
+                    batch_soup = BeautifulSoup(batch_html, 'html.parser')
+                    form_add = batch_soup.find('form')
+                    if form_add:
+                        for inp in form_add.find_all('input'):
+                            if inp.get('name') == '_token':
+                                step2_token = inp.get('value')
+                            elif inp.get('name') == 'file[]':
+                                step2_files.append(inp.get('value'))
+                                
+            if not step2_files:
+                step2_files = [f"{folder_clean}/{f}" if folder_clean else f for f in file_list]
                 
-                # Reintentos por cada copia si ocurre 419 (Page Expired)
-                for attempt in range(2):
-                    active_token = token or get_xsrf_from_cookie()
-                    post_data = {
-                        '_token': active_token,
-                        'file': rel_path,
-                        'playlist': str(playlist_id)
-                    }
-                    headers = {
-                        "Referer": "https://stream.conexion.com.ve/broadcaster/filemanager",
-                        "Origin": "https://stream.conexion.com.ve",
-                        "X-XSRF-TOKEN": active_token
-                    }
-                    
-                    async with session.post(add_url, data=post_data, headers=headers, allow_redirects=False) as resp:
-                        if resp.status in [200, 302]:
-                            added_count += 1
-                            logger.info(f"Copia {i+1}/10 agregada a playlist {playlist_id}: {rel_path}")
-                            token = get_xsrf_from_cookie() or token
-                            break
-                        elif resp.status == 419:
-                            logger.warning(f"Token CSRF expirado en copia {i+1}, renovando...")
-                            token = await fetch_fresh_form_token()
-                        else:
-                            logger.warning(f"Error al agregar copia {i+1}/10 ({rel_path}) a playlist: HTTP {resp.status}")
-                            break
-                            
-                # Pausa de 0.25s para sincronización de sesión en Laravel
-                await asyncio.sleep(0.25)
-                
-            if added_count > 0:
-                logger.info(f"Se agregaron exitosamente {added_count}/10 copias a la playlist {playlist_id}.")
-                return True, added_count
-            else:
-                logger.error(f"No se pudo agregar ninguna de las copias a la playlist {playlist_id}.")
-                return False, 0
+            # 4. POST a addtoplaylistpost (Paso 2 del batch)
+            post_add_data = [
+                ('_token', step2_token)
+            ]
+            for sf in step2_files:
+                post_add_data.append(('file[]', sf))
+            post_add_data.append(('playlist', str(playlist_id)))
+            
+            headers_step2 = {
+                "Referer": batch_url,
+                "Origin": "https://stream.conexion.com.ve",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            logger.info(f"Confirmando adición a playlist {playlist_id} en {add_url}...")
+            async with session.post(add_url, data=post_add_data, headers=headers_step2, allow_redirects=False) as resp:
+                logger.info(f"Respuesta final addtoplaylistpost: HTTP {resp.status}")
+                if resp.status in [200, 302]:
+                    logger.info(f"Lote de {len(step2_files)} copias agregado exitosamente a la playlist {playlist_id}.")
+                    return True, len(step2_files)
+                else:
+                    logger.error(f"Fallo al confirmar playlist en VDO Panel: HTTP {resp.status}")
+                    return False, 0
     except Exception as e:
         logger.error(f"Excepción en add_files_to_vdo_playlist: {e}")
         return False, 0
