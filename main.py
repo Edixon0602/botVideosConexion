@@ -229,7 +229,6 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
         return False
         
     login_url = "https://stream.conexion.com.ve/broadcaster/login"
-    batch_url = "https://stream.conexion.com.ve/broadcaster/filemanager/batch"
     add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
     
     try:
@@ -258,15 +257,14 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                     
             # 3. Obtener el CSRF token post-login
             token = None
-            async with session.get(batch_url) as resp:
-                if resp.status in [200, 302]:
-                    batch_html = await resp.text()
-                    batch_soup = BeautifulSoup(batch_html, 'html.parser')
-                    for hidden in batch_soup.find_all("input", type="hidden"):
-                        if hidden.get("name") == "_token":
-                            token = hidden.get("value")
-                            break
-                            
+            sample_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylist?file=test"
+            async with session.get(sample_url) as resp:
+                if resp.status == 200:
+                    s = BeautifulSoup(await resp.text(), 'html.parser')
+                    token_inp = s.find('input', {'name': '_token'})
+                    if token_inp:
+                        token = token_inp.get('value')
+                        
             if not token:
                 for cookie in session.cookie_jar:
                     if cookie.key == "XSRF-TOKEN":
@@ -277,34 +275,41 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 logger.error("No se pudo obtener el CSRF token para agregar a la playlist.")
                 return False
                 
-            # 4. Generar lista de los 10 archivos
+            # 4. Agregar individualmente cada una de las 10 copias
             name, ext = os.path.splitext(file_name)
             folder_clean = target_folder.strip("/") if target_folder else ""
             
-            file_entries = []
-            for i in range(10):
-                curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
-                rel_path = f"{folder_clean}/{curr_name}" if folder_clean else curr_name
-                file_entries.append(('file[]', rel_path))
-                
-            post_data = [
-                ('_token', token),
-                ('playlist', str(playlist_id))
-            ] + file_entries
-            
             headers = {
-                "Referer": batch_url,
+                "Referer": "https://stream.conexion.com.ve/broadcaster/filemanager",
                 "Origin": "https://stream.conexion.com.ve"
             }
             
-            logger.info(f"Agregando {len(file_entries)} archivos a la playlist {playlist_id} en VDO Panel...")
-            async with session.post(add_url, data=post_data, headers=headers) as resp:
-                if resp.status in [200, 302, 301]:
-                    logger.info(f"Archivos agregados exitosamente a la playlist {playlist_id}.")
-                    return True
-                else:
-                    logger.error(f"Fallo al agregar a playlist en VDO Panel: HTTP {resp.status}")
-                    return False
+            added_count = 0
+            logger.info(f"Iniciando adición de 10 copias a la playlist {playlist_id} en VDO Panel...")
+            for i in range(10):
+                curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
+                rel_path = f"{folder_clean}/{curr_name}" if folder_clean else curr_name
+                
+                post_data = {
+                    '_token': token,
+                    'file': rel_path,
+                    'playlist': str(playlist_id)
+                }
+                
+                async with session.post(add_url, data=post_data, headers=headers) as resp:
+                    resp_text = await resp.text()
+                    if "Proceso terminado" in resp_text or resp.status in [200, 302]:
+                        added_count += 1
+                        logger.info(f"Copia {i+1}/10 agregada a playlist {playlist_id}: {rel_path}")
+                    else:
+                        logger.warning(f"Error al agregar copia {i+1}/10 ({rel_path}) a playlist: HTTP {resp.status}")
+                        
+            if added_count > 0:
+                logger.info(f"Se agregaron exitosamente {added_count}/10 copias a la playlist {playlist_id}.")
+                return True
+            else:
+                logger.error(f"No se pudo agregar ninguna de las copias a la playlist {playlist_id}.")
+                return False
     except Exception as e:
         logger.error(f"Excepción en add_files_to_vdo_playlist: {e}")
         return False
