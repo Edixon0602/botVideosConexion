@@ -5,6 +5,7 @@ from ftplib import FTP
 import asyncio
 import threading
 import urllib.request
+import urllib.parse
 import time
 import aiohttp
 from bs4 import BeautifulSoup
@@ -101,20 +102,23 @@ def save_users(users):
         json.dump(users, f)
 
 DELETIONS_FILE = 'deletions.json'
+deletions_lock = threading.Lock()
 admin_states = {}
 
 def load_deletions():
-    if not os.path.exists(DELETIONS_FILE):
-        return {}
-    try:
-        with open(DELETIONS_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+    with deletions_lock:
+        if not os.path.exists(DELETIONS_FILE):
+            return {}
+        try:
+            with open(DELETIONS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
 
 def save_deletions(data):
-    with open(DELETIONS_FILE, 'w') as f:
-        json.dump(data, f)
+    with deletions_lock:
+        with open(DELETIONS_FILE, 'w') as f:
+            json.dump(data, f)
 
 # Inicializar cliente de Pyrogram
 app = Client(
@@ -214,7 +218,7 @@ async def control_vdo_panel(action_url: str) -> bool:
         logger.error(f"Excepción en control_vdo_panel: {e}")
         return False
 
-async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None) -> bool:
+async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None) -> tuple[bool, int]:
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
@@ -226,7 +230,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             
     if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
         logger.error("Credenciales de VDO Panel no configuradas.")
-        return False
+        return False, 0
         
     login_url = "https://stream.conexion.com.ve/broadcaster/login"
     add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
@@ -253,66 +257,80 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             async with session.post(login_url, data=payload) as resp:
                 if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
-                    return False
+                    return False, 0
                     
-            # 3. Obtener el CSRF token post-login
-            token = None
-            sample_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylist?file=test"
-            async with session.get(sample_url) as resp:
-                if resp.status == 200:
-                    s = BeautifulSoup(await resp.text(), 'html.parser')
-                    token_inp = s.find('input', {'name': '_token'})
-                    if token_inp:
-                        token = token_inp.get('value')
-                        
-            if not token:
+            def get_xsrf_from_cookie():
                 for cookie in session.cookie_jar:
                     if cookie.key == "XSRF-TOKEN":
-                        token = cookie.value
-                        break
-                        
+                        return urllib.parse.unquote(cookie.value)
+                return None
+
+            async def fetch_fresh_form_token():
+                try:
+                    async with session.get("https://stream.conexion.com.ve/broadcaster/addtoplaylist?file=test") as r:
+                        if r.status == 200:
+                            s = BeautifulSoup(await r.text(), 'html.parser')
+                            inp = s.find('input', {'name': '_token'})
+                            if inp:
+                                return inp.get('value')
+                except Exception:
+                    pass
+                return get_xsrf_from_cookie()
+
+            token = await fetch_fresh_form_token()
             if not token:
                 logger.error("No se pudo obtener el CSRF token para agregar a la playlist.")
-                return False
+                return False, 0
                 
             # 4. Agregar individualmente cada una de las 10 copias
             name, ext = os.path.splitext(file_name)
             folder_clean = target_folder.strip("/") if target_folder else ""
             
-            headers = {
-                "Referer": "https://stream.conexion.com.ve/broadcaster/filemanager",
-                "Origin": "https://stream.conexion.com.ve"
-            }
-            
             added_count = 0
-            logger.info(f"Iniciando adición de 10 copias a la playlist {playlist_id} en VDO Panel...")
+            logger.info(f"Iniciando adición robusta de 10 copias a la playlist {playlist_id} en VDO Panel...")
             for i in range(10):
                 curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
                 rel_path = f"{folder_clean}/{curr_name}" if folder_clean else curr_name
                 
-                post_data = {
-                    '_token': token,
-                    'file': rel_path,
-                    'playlist': str(playlist_id)
-                }
+                # Reintentos por cada copia si ocurre 419 (Page Expired)
+                for attempt in range(2):
+                    active_token = token or get_xsrf_from_cookie()
+                    post_data = {
+                        '_token': active_token,
+                        'file': rel_path,
+                        'playlist': str(playlist_id)
+                    }
+                    headers = {
+                        "Referer": "https://stream.conexion.com.ve/broadcaster/filemanager",
+                        "Origin": "https://stream.conexion.com.ve",
+                        "X-XSRF-TOKEN": active_token
+                    }
+                    
+                    async with session.post(add_url, data=post_data, headers=headers, allow_redirects=False) as resp:
+                        if resp.status in [200, 302]:
+                            added_count += 1
+                            logger.info(f"Copia {i+1}/10 agregada a playlist {playlist_id}: {rel_path}")
+                            token = get_xsrf_from_cookie() or token
+                            break
+                        elif resp.status == 419:
+                            logger.warning(f"Token CSRF expirado en copia {i+1}, renovando...")
+                            token = await fetch_fresh_form_token()
+                        else:
+                            logger.warning(f"Error al agregar copia {i+1}/10 ({rel_path}) a playlist: HTTP {resp.status}")
+                            break
+                            
+                # Pausa de 0.25s para sincronización de sesión en Laravel
+                await asyncio.sleep(0.25)
                 
-                async with session.post(add_url, data=post_data, headers=headers) as resp:
-                    resp_text = await resp.text()
-                    if "Proceso terminado" in resp_text or resp.status in [200, 302]:
-                        added_count += 1
-                        logger.info(f"Copia {i+1}/10 agregada a playlist {playlist_id}: {rel_path}")
-                    else:
-                        logger.warning(f"Error al agregar copia {i+1}/10 ({rel_path}) a playlist: HTTP {resp.status}")
-                        
             if added_count > 0:
                 logger.info(f"Se agregaron exitosamente {added_count}/10 copias a la playlist {playlist_id}.")
-                return True
+                return True, added_count
             else:
                 logger.error(f"No se pudo agregar ninguna de las copias a la playlist {playlist_id}.")
-                return False
+                return False, 0
     except Exception as e:
         logger.error(f"Excepción en add_files_to_vdo_playlist: {e}")
-        return False
+        return False, 0
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
@@ -378,10 +396,19 @@ async def handle_video(client: Client, message: Message):
             target_folder = allowed_users[f"@{username}"].get("ftp_path", "")
             user_name = allowed_users[f"@{username}"].get("name", "Usuario")
             
+    # Si el usuario es el administrador configurado en NOTIFICATION_CHAT_ID
+    if not is_allowed and NOTIFICATION_CHAT_ID and user_id == str(NOTIFICATION_CHAT_ID):
+        is_allowed = True
+        target_folder = target_folder or FTP_UPLOAD_PATH or "avances-informativos"
+        user_name = user_name or message.from_user.first_name or "Administrador"
+
     if not is_allowed:
         logger.warning(f"Acceso denegado al usuario: {user_id} (@{username})")
         await message.reply_text(f"❌ No estás autorizado para subir videos. Pide acceso al administrador indicando tu ID numérico: `{user_id}` o tu usuario: `@{username or 'Sin usuario'}`")
         return
+
+    if not target_folder:
+        target_folder = FTP_UPLOAD_PATH or "avances-informativos"
 
     # Extraer información del archivo (ya sea video o documento como MP4)
     file = message.video or message.document
@@ -470,9 +497,12 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     target_folder = info.get("ftp_path", "")
     file_name = info.get("file_name", "")
     
+    if not target_folder:
+        target_folder = FTP_UPLOAD_PATH or "avances-informativos"
+    
     await callback_query.answer("⏳ Agregando las 10 copias a la Lista Musical...", show_alert=False)
     
-    success = await add_files_to_vdo_playlist(target_folder, file_name)
+    success, count = await add_files_to_vdo_playlist(target_folder, file_name)
     
     if success:
         deletions[file_id]["playlist_added"] = True
@@ -485,19 +515,19 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
                 new_row = []
                 for btn in row:
                     if btn.callback_data and btn.callback_data.startswith("addpl_"):
-                        new_row.append(InlineKeyboardButton("✅ Agregado a Lista Musical", callback_data=f"noop_{file_id}"))
+                        new_row.append(InlineKeyboardButton(f"✅ Agregado ({count}/10)", callback_data=f"noop_{file_id}"))
                     else:
                         new_row.append(btn)
                 new_rows.append(new_row)
         else:
-            new_rows = [[InlineKeyboardButton("✅ Agregado a Lista Musical", callback_data=f"noop_{file_id}")]]
+            new_rows = [[InlineKeyboardButton(f"✅ Agregado ({count}/10)", callback_data=f"noop_{file_id}")]]
             
         try:
             await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
         except Exception:
             pass
             
-        await callback_query.message.reply_text(f"🎵 ✅ **10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
+        await callback_query.message.reply_text(f"🎵 ✅ **{count}/10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
     else:
         await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
 
