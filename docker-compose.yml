@@ -1,0 +1,19 @@
+services:
+  bot-videos:
+    build:
+      context: ./botVideosConexion
+      dockerfile: Dockerfile
+    container_name: bot_videos_conexion
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - ./botVideosConexion/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Caracas
+    volumes:
+      # Persistencia de los usuarios autorizados
+      - ./botVideosConexion/users.json:/app/users.json
+      # Persistencia de las tareas de autodestrucción de videos
+      - ./botVideosConexion/deletions.json:/app/deletions.json
