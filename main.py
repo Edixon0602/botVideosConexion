@@ -421,6 +421,17 @@ async def cmd_stop_stream(client: Client, message: Message):
     else:
         await msg.edit_text("❌ Error al detener el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
 
+async def edit_message_or_caption(message: Message, new_text: str, reply_markup=None):
+    try:
+        if message.video or message.document or message.photo or message.caption:
+            await message.edit_caption(caption=new_text, reply_markup=reply_markup)
+        else:
+            await message.edit_text(text=new_text, reply_markup=reply_markup)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.error(f"Error editando mensaje/caption: {e}")
+
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
     user_id = str(message.from_user.id)
@@ -487,7 +498,7 @@ async def handle_video(client: Client, message: Message):
         
         # Notificar al administrador si está configurado
         if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
-            user_name = message.from_user.first_name or "Usuario"
+            user_first = message.from_user.first_name or "Usuario"
             file_id = str(uuid.uuid4())[:8]
             
             deletions = load_deletions()
@@ -507,14 +518,45 @@ async def handle_video(client: Client, message: Message):
                  InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
             ])
             
+            caption_text = (
+                f"🔔 **NUEVO VIDEO SUBIDO**\n\n"
+                f"👤 **Usuario:** {user_name} ({user_first} - ID: `{user_id}`)\n"
+                f"📁 **Archivo:** `{file_name}`\n"
+                f"📂 **Destino:** `{folder_display}`\n\n"
+                f"¿Cuándo deseas que se elimine automáticamente?"
+            )
+            
             try:
-                await client.send_message(
-                    chat_id=int(NOTIFICATION_CHAT_ID),
-                    text=f"🔔 **NUEVO VIDEO SUBIDO**\n\n👤 **Usuario:** {user_name} (ID: `{user_id}`)\n📁 **Archivo:** `{file_name}`\n📂 **Destino:** `{folder_display}`\n\n¿Cuándo deseas que se elimine automáticamente?",
-                    reply_markup=keyboard
-                )
+                if message.video:
+                    await client.send_video(
+                        chat_id=int(NOTIFICATION_CHAT_ID),
+                        video=message.video.file_id,
+                        caption=caption_text,
+                        reply_markup=keyboard
+                    )
+                elif message.document:
+                    await client.send_document(
+                        chat_id=int(NOTIFICATION_CHAT_ID),
+                        document=message.document.file_id,
+                        caption=caption_text,
+                        reply_markup=keyboard
+                    )
+                else:
+                    await client.send_message(
+                        chat_id=int(NOTIFICATION_CHAT_ID),
+                        text=caption_text,
+                        reply_markup=keyboard
+                    )
             except Exception as e:
-                logger.error(f"No se pudo enviar notificación: {e}")
+                logger.error(f"No se pudo enviar notificación multimedia: {e}")
+                try:
+                    await client.send_message(
+                        chat_id=int(NOTIFICATION_CHAT_ID),
+                        text=caption_text,
+                        reply_markup=keyboard
+                    )
+                except Exception as e2:
+                    logger.error(f"Tampoco se pudo enviar notificación de respaldo: {e2}")
         
     except MessageNotModified:
         pass
@@ -588,11 +630,13 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
         return
         
     admin_id = callback_query.from_user.id
+    current_content = callback_query.message.caption or callback_query.message.text or ""
     
     if action == "cust":
         admin_states[admin_id] = {"action": "awaiting_custom_date", "file_id": file_id}
-        await callback_query.message.edit_text(
-            callback_query.message.text + "\n\n✍️ **Por favor, escribe en el chat la cantidad de días** que debe durar el archivo (ej: `15`) o una fecha en formato `YYYY-MM-DD`."
+        await edit_message_or_caption(
+            callback_query.message,
+            current_content + "\n\n✍️ **Por favor, escribe en el chat la cantidad de días** que debe durar el archivo (ej: `15`) o una fecha en formato `YYYY-MM-DD`."
         )
         await callback_query.answer()
         return
@@ -624,8 +668,9 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     is_added = deletions[file_id].get("playlist_added", False)
     pl_btn = InlineKeyboardButton("✅ Agregado a Lista Musical" if is_added else "🎵 Agregar a Lista Musical", callback_data=f"noop_{file_id}" if is_added else f"addpl_{file_id}")
     
-    await callback_query.message.edit_text(
-        callback_query.message.text + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
+    await edit_message_or_caption(
+        callback_query.message,
+        current_content + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
         reply_markup=InlineKeyboardMarkup([[pl_btn]])
     )
     await callback_query.answer("Programado exitosamente.")
