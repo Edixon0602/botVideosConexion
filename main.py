@@ -383,12 +383,16 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
         logger.error(f"Excepción en add_files_to_vdo_playlist: {e}")
         return False, 0
 
-@app.on_message(filters.command("start"))
+@app.on_message(filters.incoming & ~filters.me & filters.command("start") & filters.private)
 async def start(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
     await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
 
-@app.on_message(filters.command("iniciar"))
+@app.on_message(filters.incoming & ~filters.me & filters.command("iniciar") & filters.private)
 async def cmd_start_stream(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
@@ -404,8 +408,10 @@ async def cmd_start_stream(client: Client, message: Message):
     else:
         await msg.edit_text("❌ Error al iniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
 
-@app.on_message(filters.command("detener"))
+@app.on_message(filters.incoming & ~filters.me & filters.command("detener") & filters.private)
 async def cmd_stop_stream(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
@@ -432,8 +438,18 @@ async def edit_message_or_caption(message: Message, new_text: str, reply_markup=
     except Exception as e:
         logger.error(f"Error editando mensaje/caption: {e}")
 
-@app.on_message(filters.video | filters.document)
+@app.on_message(filters.incoming & ~filters.me & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+
+    # Si es documento, verificar que sea un archivo de video (evitar procesar pdfs, zips, etc.)
+    if message.document:
+        mime = message.document.mime_type or ""
+        doc_name = (message.document.file_name or "").lower()
+        if not (mime.startswith("video/") or doc_name.endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm', '.ts', '.m4v'))):
+            return
+
     user_id = str(message.from_user.id)
     username = message.from_user.username
     
@@ -675,8 +691,10 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     )
     await callback_query.answer("Programado exitosamente.")
 
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.incoming & ~filters.me & filters.text & filters.private)
 async def handle_admin_text(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
     if message.text and message.text.startswith("/"):
         return
         
