@@ -224,9 +224,9 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
     
     if playlist_id is None:
         try:
-            playlist_id = int(os.getenv("VDOPANEL_PLAYLIST_ID", "3"))
+            playlist_id = int(os.getenv("VDOPANEL_PLAYLIST_ID", "12"))
         except ValueError:
-            playlist_id = 3
+            playlist_id = 12
             
     if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
         logger.error("Credenciales de VDO Panel no configuradas.")
