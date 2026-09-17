@@ -60,6 +60,22 @@ ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
 
+# Lista de administradores autorizados (soporta múltiples IDs)
+ADMIN_CHAT_IDS = [1094100980]  # ID admin Edixon
+if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
+    for cid in str(NOTIFICATION_CHAT_ID).split(","):
+        cid = cid.strip()
+        if cid.lstrip("-").isdigit():
+            val = int(cid)
+            if val not in ADMIN_CHAT_IDS:
+                ADMIN_CHAT_IDS.append(val)
+
+def is_admin(chat_id) -> bool:
+    try:
+        return int(chat_id) in ADMIN_CHAT_IDS
+    except (ValueError, TypeError):
+        return False
+
 if not BOT_TOKEN or BOT_TOKEN == "tu_token_aqui":
     print("⚠️ ERROR: POR FAVOR, COLOCA TU TOKEN EN EL ARCHIVO .env")
     exit(1)
@@ -424,7 +440,7 @@ async def start(client: Client, message: Message):
         return
     user_id = str(message.from_user.id)
     allowed_users = load_users()
-    if user_id in allowed_users:
+    if user_id in allowed_users or is_admin(user_id):
         await message.reply_text(
             "👋 ¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.\n\n"
             "📺 **Comandos de Transmisión (VDO Panel):**\n"
@@ -446,7 +462,7 @@ async def cmd_start_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
-    if user_id not in allowed_users:
+    if user_id not in allowed_users and not is_admin(user_id):
         await message.reply_text("❌ No estás autorizado para controlar el stream.")
         return
         
@@ -465,7 +481,7 @@ async def cmd_stop_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
-    if user_id not in allowed_users:
+    if user_id not in allowed_users and not is_admin(user_id):
         await message.reply_text("❌ No estás autorizado para controlar el stream.")
         return
         
@@ -484,7 +500,7 @@ async def cmd_restart_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
-    if user_id not in allowed_users:
+    if user_id not in allowed_users and not is_admin(user_id):
         await message.reply_text("❌ No estás autorizado para controlar el stream.")
         return
         
@@ -503,7 +519,7 @@ async def cmd_status_stream(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     
-    if user_id not in allowed_users:
+    if user_id not in allowed_users and not is_admin(user_id):
         await message.reply_text("❌ No estás autorizado para consultar el estado del stream.")
         return
         
@@ -611,8 +627,8 @@ async def handle_video(client: Client, message: Message):
         except MessageNotModified:
             pass
         
-        # Notificar al administrador si está configurado
-        if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
+        # Notificar a los administradores
+        if ADMIN_CHAT_IDS:
             user_first = message.from_user.first_name or "Usuario"
             file_id = str(uuid.uuid4())[:8]
             
@@ -641,37 +657,38 @@ async def handle_video(client: Client, message: Message):
                 f"¿Cuándo deseas que se elimine automáticamente?"
             )
             
-            try:
-                if message.video:
-                    await client.send_video(
-                        chat_id=int(NOTIFICATION_CHAT_ID),
-                        video=message.video.file_id,
-                        caption=caption_text,
-                        reply_markup=keyboard
-                    )
-                elif message.document:
-                    await client.send_document(
-                        chat_id=int(NOTIFICATION_CHAT_ID),
-                        document=message.document.file_id,
-                        caption=caption_text,
-                        reply_markup=keyboard
-                    )
-                else:
-                    await client.send_message(
-                        chat_id=int(NOTIFICATION_CHAT_ID),
-                        text=caption_text,
-                        reply_markup=keyboard
-                    )
-            except Exception as e:
-                logger.error(f"No se pudo enviar notificación multimedia: {e}")
+            for admin_chat_id in ADMIN_CHAT_IDS:
                 try:
-                    await client.send_message(
-                        chat_id=int(NOTIFICATION_CHAT_ID),
-                        text=caption_text,
-                        reply_markup=keyboard
-                    )
-                except Exception as e2:
-                    logger.error(f"Tampoco se pudo enviar notificación de respaldo: {e2}")
+                    if message.video:
+                        await client.send_video(
+                            chat_id=admin_chat_id,
+                            video=message.video.file_id,
+                            caption=caption_text,
+                            reply_markup=keyboard
+                        )
+                    elif message.document:
+                        await client.send_document(
+                            chat_id=admin_chat_id,
+                            document=message.document.file_id,
+                            caption=caption_text,
+                            reply_markup=keyboard
+                        )
+                    else:
+                        await client.send_message(
+                            chat_id=admin_chat_id,
+                            text=caption_text,
+                            reply_markup=keyboard
+                        )
+                except Exception as e:
+                    logger.error(f"No se pudo enviar notificación multimedia a admin {admin_chat_id}: {e}")
+                    try:
+                        await client.send_message(
+                            chat_id=admin_chat_id,
+                            text=caption_text,
+                            reply_markup=keyboard
+                        )
+                    except Exception as e2:
+                        logger.error(f"Tampoco se pudo enviar notificación de respaldo a admin {admin_chat_id}: {e2}")
         
     except MessageNotModified:
         pass
@@ -1053,17 +1070,17 @@ def auto_delete_worker():
                     success = ftp_delete_file(ftp_path, file_name)
                     
                     if success:
-                        if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
+                        for admin_chat_id in ADMIN_CHAT_IDS:
                             try:
                                 asyncio.run_coroutine_threadsafe(
                                     app.send_message(
-                                        chat_id=int(NOTIFICATION_CHAT_ID),
+                                        chat_id=admin_chat_id,
                                         text=f"🗑️ **Autodestrucción Ejecutada**\nEl archivo `{file_name}` ha sido eliminado del FTP por haber cumplido su fecha de caducidad."
                                     ),
                                     loop
                                 )
                             except Exception as e:
-                                logger.error(f"Error enviando notif de borrado: {e}")
+                                logger.error(f"Error enviando notif de borrado a admin {admin_chat_id}: {e}")
                                 
                     del deletions[file_id]
                     modified = True
