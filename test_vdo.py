@@ -56,4 +56,5 @@ async def control_vdo_panel(action_url: str) -> bool:
         return False
 
 if __name__ == "__main__":
-    asyncio.run(control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-webtv"))
+    asyncio.run(control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm"))
+

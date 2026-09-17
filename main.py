@@ -207,8 +207,12 @@ async def control_vdo_panel(action_url: str) -> bool:
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False
                 
-            # 3. Ejecutar la acción solicitada (start o stop)
-            async with session.get(action_url) as resp:
+            # 3. Ejecutar la acción solicitada (start, stop o restart)
+            headers = {
+                "Referer": "https://stream.conexion.com.ve/broadcaster",
+                "User-Agent": "Mozilla/5.0"
+            }
+            async with session.get(action_url, headers=headers) as resp:
                 if resp.status in [200, 302, 301]:
                     return True
                 else:
@@ -217,6 +221,37 @@ async def control_vdo_panel(action_url: str) -> bool:
     except Exception as e:
         logger.error(f"Excepción en control_vdo_panel: {e}")
         return False
+
+async def get_vdo_stream_status() -> dict | None:
+    vdo_user = os.getenv("VDOPANEL_USER")
+    vdo_pass = os.getenv("VDOPANEL_PASS")
+    
+    if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
+        return None
+        
+    login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    ajax_url = "https://stream.conexion.com.ve/broadcaster/ajax-get-current-running"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(login_url) as resp:
+                html = await resp.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            payload = {"name": vdo_user, "password": vdo_pass}
+            for hidden in soup.find_all("input", type="hidden"):
+                if hidden.get("name"):
+                    payload[hidden.get("name")] = hidden.get("value")
+            async with session.post(login_url, data=payload) as resp:
+                if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
+                    return None
+                    
+            async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    return data.get("options", {})
+    except Exception as e:
+        logger.error(f"Error consultando estado del stream: {e}")
+    return None
 
 async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None) -> tuple[bool, int]:
     vdo_user = os.getenv("VDOPANEL_USER")
@@ -387,7 +422,22 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
 async def start(client: Client, message: Message):
     if not message.from_user or message.from_user.is_bot:
         return
-    await message.reply_text("¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.")
+    user_id = str(message.from_user.id)
+    allowed_users = load_users()
+    if user_id in allowed_users:
+        await message.reply_text(
+            "👋 ¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.\n\n"
+            "📺 **Comandos de Transmisión (VDO Panel):**\n"
+            "▶️ `/iniciar` - Iniciar streaming\n"
+            "⏹️ `/detener` - Detener streaming\n"
+            "🔄 `/reiniciar` - Reiniciar streaming\n"
+            "📡 `/estado` - Consultar estado actual del streaming"
+        )
+    else:
+        await message.reply_text(
+            f"👋 ¡Hola! No estás autorizado aún.\n"
+            f"Pide acceso al administrador indicando tu ID numérico: `{user_id}`"
+        )
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("iniciar") & filters.private)
 async def cmd_start_stream(client: Client, message: Message):
@@ -401,7 +451,7 @@ async def cmd_start_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **INICIAR** el stream en VDO Panel...")
-    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-webtv")
+    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-serv-confirm")
     
     if success:
         await msg.edit_text("✅ Stream **INICIADO** exitosamente.")
@@ -420,12 +470,61 @@ async def cmd_stop_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **DETENER** el stream en VDO Panel...")
-    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-webtv")
+    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm")
     
     if success:
         await msg.edit_text("✅ Stream **DETENIDO** exitosamente.")
     else:
         await msg.edit_text("❌ Error al detener el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("reiniciar") & filters.private)
+async def cmd_restart_stream(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+    user_id = str(message.from_user.id)
+    allowed_users = load_users()
+    
+    if user_id not in allowed_users:
+        await message.reply_text("❌ No estás autorizado para controlar el stream.")
+        return
+        
+    msg = await message.reply_text("⏳ Intentando **REINICIAR** el stream en VDO Panel...")
+    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/restart-serv-confirm")
+    
+    if success:
+        await msg.edit_text("✅ Stream **REINICIADO** exitosamente.")
+    else:
+        await msg.edit_text("❌ Error al reiniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("estado") & filters.private)
+async def cmd_status_stream(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+    user_id = str(message.from_user.id)
+    allowed_users = load_users()
+    
+    if user_id not in allowed_users:
+        await message.reply_text("❌ No estás autorizado para consultar el estado del stream.")
+        return
+        
+    msg = await message.reply_text("⏳ Consultando estado en VDO Panel...")
+    status_info = await get_vdo_stream_status()
+    
+    if status_info is not None:
+        status_name = status_info.get("status_name", "Desconocido")
+        playlist = status_info.get("playli_stname", "Ninguna")
+        video = status_info.get("video_name", "Ninguno")
+        
+        status_emoji = "🟢" if str(status_name).lower() == "live" else "🔴"
+        text = (
+            f"📡 **ESTADO DE LA TRANSMISIÓN**\n\n"
+            f"{status_emoji} **Estado:** `{status_name}`\n"
+            f"📋 **Playlist:** `{playlist}`\n"
+            f"🎬 **Video actual:** `{video}`"
+        )
+        await msg.edit_text(text)
+    else:
+        await msg.edit_text("❌ No se pudo obtener el estado de VDO Panel. Revisa las credenciales o conexión.")
 
 async def edit_message_or_caption(message: Message, new_text: str, reply_markup=None):
     try:
