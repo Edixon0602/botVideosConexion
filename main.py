@@ -61,7 +61,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
 
 # Lista de administradores autorizados (soporta múltiples IDs)
-ADMIN_CHAT_IDS = [1094100980, 8905438807]  # IDs admin Edixon
+ADMIN_CHAT_IDS = [1094100980]  # ID admin Edixon
 if NOTIFICATION_CHAT_ID and NOTIFICATION_CHAT_ID != "tu_chat_id_aqui":
     for cid in str(NOTIFICATION_CHAT_ID).split(","):
         cid = cid.strip()
