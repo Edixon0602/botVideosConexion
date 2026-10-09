@@ -1,4 +1,5 @@
 import os
+import subprocess
 import json
 import logging
 from ftplib import FTP
@@ -183,6 +184,60 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
         
     ftp.quit()
     logger.info("Subida de 10 copias al FTP completada.")
+
+def extract_audio_from_video(video_path: str, output_audio_path: str) -> bool:
+    """Extrae el audio de un video en formato MP3 usando ffmpeg"""
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-b:a", "192k",
+            output_audio_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(output_audio_path):
+            logger.info(f"Audio extraído exitosamente con ffmpeg: {output_audio_path}")
+            return True
+        else:
+            logger.error(f"Error extrayendo audio con ffmpeg: {res.stderr.decode('utf-8', errors='ignore')}")
+            return False
+    except Exception as e:
+        logger.error(f"Excepción al ejecutar ffmpeg: {e}")
+        return False
+
+def upload_audio_to_dropbox(local_audio_path: str, dropbox_folder: str = None) -> bool:
+    """Sube un archivo de audio a la carpeta de Dropbox usando refresh token"""
+    app_key = os.getenv("DROPBOX_APP_KEY")
+    app_secret = os.getenv("DROPBOX_APP_SECRET")
+    refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN")
+    
+    if not (app_key and app_secret and refresh_token):
+        logger.warning("Credenciales de Dropbox no configuradas en .env. Se omite la subida a Dropbox.")
+        return False
+        
+    try:
+        import dropbox
+        dbx = dropbox.Dropbox(
+            app_key=app_key,
+            app_secret=app_secret,
+            oauth2_refresh_token=refresh_token
+        )
+        folder = dropbox_folder or os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
+        folder_clean = "/" + folder.strip("/") if folder.strip("/") else ""
+        filename = os.path.basename(local_audio_path)
+        dest_path = f"{folder_clean}/{filename}"
+        
+        logger.info(f"Subiendo audio a Dropbox en {dest_path}...")
+        with open(local_audio_path, "rb") as f:
+            dbx.files_upload(f.read(), dest_path, mode=dropbox.files.WriteMode.overwrite)
+            
+        logger.info(f"Audio subido exitosamente a Dropbox: {dest_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error al subir audio a Dropbox: {e}")
+        return False
 
 async def control_vdo_panel(action_url: str) -> bool:
     vdo_user = os.getenv("VDOPANEL_USER")
@@ -618,12 +673,28 @@ async def handle_video(client: Client, message: Message):
         # 2. Subir por FTP en un hilo separado para no bloquear el event loop de Telegram
         await asyncio.to_thread(upload_to_ftp, local_path, file_name, target_folder)
         
-        # 3. Eliminar archivo temporal local
+        # 3. Extraer audio y subir a Dropbox si está configurado
+        dropbox_uploaded = False
+        try:
+            base_name, _ = os.path.splitext(local_path)
+            audio_path = f"{base_name}.mp3"
+            if extract_audio_from_video(local_path, audio_path):
+                dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
+                dropbox_uploaded = await asyncio.to_thread(upload_audio_to_dropbox, audio_path, dropbox_folder)
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+        except Exception as e_dbx:
+            logger.error(f"Error procesando audio para Dropbox: {e_dbx}")
+        
+        # 4. Eliminar archivo temporal local
         if os.path.exists(local_path):
             os.remove(local_path)
         
         try:
-            await status_msg.edit_text(f"✅ ¡Video subido exitosamente a la carpeta `{folder_display}`!\nArchivo: `{file_name}`")
+            success_text = f"✅ ¡Video subido exitosamente a la carpeta `{folder_display}`!\nArchivo: `{file_name}`"
+            if dropbox_uploaded:
+                success_text += "\n🎵 Audio extraído y subido a Dropbox (`/CNX-INFORMATIVA`)."
+            await status_msg.edit_text(success_text)
         except MessageNotModified:
             pass
         
@@ -649,11 +720,12 @@ async def handle_video(client: Client, message: Message):
                  InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
             ])
             
+            dropbox_info = "\n🎵 **Audio en Dropbox:** ✅ Subido (`/CNX-INFORMATIVA`)" if dropbox_uploaded else ""
             caption_text = (
                 f"🔔 **NUEVO VIDEO SUBIDO**\n\n"
                 f"👤 **Usuario:** {user_name} ({user_first} - ID: `{user_id}`)\n"
                 f"📁 **Archivo:** `{file_name}`\n"
-                f"📂 **Destino:** `{folder_display}`\n\n"
+                f"📂 **Destino:** `{folder_display}`{dropbox_info}\n\n"
                 f"¿Cuándo deseas que se elimine automáticamente?"
             )
             
