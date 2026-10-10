@@ -964,6 +964,92 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     else:
         await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
 
+async def execute_instagram_publish(client: Client, callback_query: CallbackQuery, file_id: str, final_caption: str):
+    """Ejecuta la descarga del video y publicación en Instagram con el caption especificado."""
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    file_name = info.get("file_name", "video.mp4")
+
+    # Actualizar botón a estado procesando
+    current_markup = callback_query.message.reply_markup
+    processing_rows = []
+    if current_markup and current_markup.inline_keyboard:
+        for row in current_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                if btn.callback_data and (btn.callback_data.startswith("ig_") or btn.callback_data.startswith("noop_ig_")):
+                    new_row.append(InlineKeyboardButton("⏳ Procesando Instagram...", callback_data=f"noop_ig_{file_id}"))
+                else:
+                    new_row.append(btn)
+            processing_rows.append(new_row)
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(processing_rows))
+    except Exception:
+        pass
+
+    temp_video_path = None
+    try:
+        status_msg = await callback_query.message.reply_text("⏳ Descargando video de Telegram para Instagram...")
+        temp_video_path = await callback_query.message.download()
+
+        await status_msg.edit_text("⏳ Conectando con Meta y procesando Reel...")
+        success, result, detail = await asyncio.to_thread(publish_video_to_instagram, temp_video_path, final_caption)
+
+        if success:
+            if result == "dry_run":
+                btn_label = "✅ Validado (Dry Run)"
+                alert_text = (
+                    "🧪 **[Modo Simulación / Dry Run]**\n\n"
+                    "✅ El video fue enviado y procesado exitosamente por Instagram (Meta).\n"
+                    f"📝 **Caption:**\n_{final_caption or 'Sin caption'}_\n\n"
+                    "Como el modo de prueba está activo, **NO** fue publicado en el feed público.\n\n"
+                    "💡 Cuando desees publicar directamente, avísame para desactivar el Dry Run."
+                )
+            else:
+                btn_label = "✅ Publicado en IG"
+                alert_text = (
+                    f"📸 ✅ **¡Reel publicado exitosamente en Instagram!**\n\n"
+                    f"📝 **Caption:**\n_{final_caption or 'Sin caption'}_\n\n"
+                    f"🔗 Enlace: {result}"
+                )
+
+            success_rows = []
+            if current_markup and current_markup.inline_keyboard:
+                for row in current_markup.inline_keyboard:
+                    new_row = []
+                    for btn in row:
+                        if btn.callback_data and (btn.callback_data.startswith("ig_") or btn.callback_data.startswith("noop_ig_")):
+                            new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_ig_{file_id}"))
+                        else:
+                            new_row.append(btn)
+                    success_rows.append(new_row)
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(success_rows))
+            except Exception:
+                pass
+
+            await status_msg.edit_text(alert_text)
+        else:
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=current_markup)
+            except Exception:
+                pass
+            await status_msg.edit_text(f"❌ **Error al procesar en Instagram:**\n`{detail}`")
+
+    except Exception as e:
+        logger.error(f"Error en publicación de Instagram: {e}")
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=current_markup)
+        except Exception:
+            pass
+        await callback_query.message.reply_text(f"❌ Error inesperado: `{e}`")
+    finally:
+        if temp_video_path and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except Exception:
+                pass
+
 @app.on_callback_query(filters.regex(r"^ig_pub_"))
 async def handle_instagram_publish_callback(client: Client, callback_query: CallbackQuery):
     if not is_admin(callback_query.from_user.id):
@@ -978,7 +1064,6 @@ async def handle_instagram_publish_callback(client: Client, callback_query: Call
     file_name = info.get("file_name", "video.mp4")
     caption = info.get("caption", "")
 
-    # Fallback si no tiene caption en deletions: buscar el caption del mensaje original o base del nombre
     if not caption:
         msg = callback_query.message
         if msg.caption:
@@ -986,90 +1071,66 @@ async def handle_instagram_publish_callback(client: Client, callback_query: Call
         if not caption:
             caption = os.path.splitext(file_name)[0]
 
-    # Actualizar botón a estado procesando
-    current_markup = callback_query.message.reply_markup
-    processing_rows = []
-    if current_markup and current_markup.inline_keyboard:
-        for row in current_markup.inline_keyboard:
-            new_row = []
-            for btn in row:
-                if btn.callback_data and btn.callback_data.startswith("ig_pub_"):
-                    new_row.append(InlineKeyboardButton("⏳ Procesando Instagram...", callback_data=f"noop_ig_{file_id}"))
-                else:
-                    new_row.append(btn)
-            processing_rows.append(new_row)
-    try:
-        await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(processing_rows))
-    except Exception:
-        pass
+    # Presentar opciones de confirmación/edición del caption
+    preview_caption = caption if caption else "(Sin texto / Vacío)"
+    text = (
+        f"📸 **PUBLICACIÓN EN INSTAGRAM**\n\n"
+        f"📝 **Caption actual:**\n"
+        f"_{preview_caption}_\n\n"
+        f"¿Deseas publicar con este texto o editarlo?"
+    )
 
-    await callback_query.answer("🚀 Procesando publicación para Instagram...", show_alert=False)
+    confirm_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmar y Publicar", callback_data=f"ig_go_{file_id}")],
+        [InlineKeyboardButton("✏️ Editar Caption", callback_data=f"ig_edit_{file_id}")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"ig_cancel_{file_id}")]
+    ])
 
-    temp_video_path = None
-    try:
-        # Descargar el video desde el mensaje de Telegram
-        status_msg = await callback_query.message.reply_text("⏳ Descargando video de Telegram para Instagram...")
-        temp_video_path = await callback_query.message.download()
+    await callback_query.message.reply_text(text, reply_markup=confirm_keyboard)
+    await callback_query.answer()
 
-        await status_msg.edit_text("⏳ Conectando con Meta y procesando Reel...")
-        success, result, detail = await asyncio.to_thread(publish_video_to_instagram, temp_video_path, caption)
+@app.on_callback_query(filters.regex(r"^ig_go_"))
+async def handle_ig_go_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
 
-        if success:
-            if result == "dry_run":
-                # Modo Dry-Run exitoso
-                btn_label = "✅ Validado (Dry Run)"
-                alert_text = (
-                    "🧪 **[Modo Simulación / Dry Run]**\n\n"
-                    "✅ El video fue enviado y procesado exitosamente por Instagram (Meta).\n"
-                    "Como el modo de prueba está activo, **NO** fue publicado en el feed público.\n\n"
-                    "💡 Cuando desees publicar directamente, avísame para desactivar el Dry Run."
-                )
-            else:
-                # Publicado en vivo exitosamente
-                btn_label = "✅ Publicado en IG"
-                alert_text = (
-                    f"📸 ✅ **¡Reel publicado exitosamente en Instagram!**\n\n"
-                    f"🔗 Enlace: {result}"
-                )
+    _, _, file_id = callback_query.data.partition("ig_go_")
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    caption = info.get("caption", "")
 
-            # Marcar botón de éxito
-            success_rows = []
-            if current_markup and current_markup.inline_keyboard:
-                for row in current_markup.inline_keyboard:
-                    new_row = []
-                    for btn in row:
-                        if btn.callback_data and btn.callback_data.startswith("ig_pub_"):
-                            new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_ig_{file_id}"))
-                        else:
-                            new_row.append(btn)
-                    success_rows.append(new_row)
-            try:
-                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(success_rows))
-            except Exception:
-                pass
+    await callback_query.answer("🚀 Iniciando publicación...", show_alert=False)
+    await callback_query.message.delete()
+    await execute_instagram_publish(client, callback_query, file_id, caption)
 
-            await status_msg.edit_text(alert_text)
-        else:
-            # Restaurar botón si falló
-            try:
-                await callback_query.message.edit_reply_markup(reply_markup=current_markup)
-            except Exception:
-                pass
-            await status_msg.edit_text(f"❌ **Error al procesar en Instagram:**\n`{detail}`")
+@app.on_callback_query(filters.regex(r"^ig_edit_"))
+async def handle_ig_edit_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
 
-    except Exception as e:
-        logger.error(f"Error en callback de Instagram: {e}")
-        try:
-            await callback_query.message.edit_reply_markup(reply_markup=current_markup)
-        except Exception:
-            pass
-        await callback_query.message.reply_text(f"❌ Error inesperado: `{e}`")
-    finally:
-        if temp_video_path and os.path.exists(temp_video_path):
-            try:
-                os.remove(temp_video_path)
-            except Exception:
-                pass
+    _, _, file_id = callback_query.data.partition("ig_edit_")
+    admin_states[admin_id] = {
+        "action": "awaiting_instagram_caption",
+        "file_id": file_id,
+        "callback_query": callback_query
+    }
+
+    await callback_query.message.edit_text(
+        "✏️ **Escribe en el chat el nuevo caption/texto para Instagram.**\n\n"
+        "Puedes incluir hashtags (#) y menciones (@). En cuanto lo envíes, comenzará la publicación."
+    )
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^ig_cancel_"))
+async def handle_ig_cancel_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_instagram_caption":
+        del admin_states[admin_id]
+    await callback_query.message.delete()
+    await callback_query.answer("Operación cancelada.")
 
 @app.on_callback_query(filters.regex(r"^noop_ig_"))
 async def handle_noop_ig_callback(client: Client, callback_query: CallbackQuery):
@@ -1143,6 +1204,22 @@ async def handle_admin_text(client: Client, message: Message):
         return
         
     admin_id = message.from_user.id
+    if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_instagram_caption":
+        state = admin_states.pop(admin_id)
+        file_id = state["file_id"]
+        cb_query = state.get("callback_query")
+        new_caption = message.text.strip()
+
+        # Actualizar caption en deletions para persistencia
+        deletions = load_deletions()
+        if file_id in deletions:
+            deletions[file_id]["caption"] = new_caption
+            save_deletions(deletions)
+
+        await message.reply_text(f"📝 **Nuevo caption guardado:**\n_{new_caption}_\n\n🚀 Iniciando subida a Instagram...")
+        await execute_instagram_publish(client, cb_query, file_id, new_caption)
+        return
+
     if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_custom_date":
         file_id = admin_states[admin_id]["file_id"]
         text = message.text.strip()
