@@ -239,7 +239,150 @@ def upload_audio_to_dropbox(local_audio_path: str, dropbox_folder: str = None) -
         logger.error(f"Error al subir audio a Dropbox: {e}")
         return False
 
+def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tuple[bool, str, str]:
+    """
+    Sube un video a Instagram Reels usando la API oficial Graph de Meta.
+    Flujo:
+    1. Sube video temporalmente a Dropbox para obtener un enlace público HTTPS directo.
+    2. Crea contenedor de video en Instagram Graph API (POST /{ig_user_id}/media).
+    3. Espera a que Meta procese el video (polling de status_code == FINISHED).
+    4. Limpia el archivo temporal en Dropbox.
+    5. Si INSTAGRAM_DRY_RUN es True, no publica en el feed (simulación completada con éxito).
+       Si es False, publica en vivo (POST /{ig_user_id}/media_publish) y retorna permalink.
+    Retorna: (éxito, permalink_o_status, mensaje_detalle)
+    """
+    account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
+    access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+    dry_run = os.getenv("INSTAGRAM_DRY_RUN", "False").lower() in ("true", "1", "yes")
+
+    if not account_id or not access_token:
+        return False, "", "Credenciales de Instagram no configuradas en .env"
+
+    app_key = os.getenv("DROPBOX_APP_KEY")
+    app_secret = os.getenv("DROPBOX_APP_SECRET")
+    refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN")
+
+    if not (app_key and app_secret and refresh_token):
+        return False, "", "Credenciales de Dropbox requeridas para generar enlace público temporal"
+
+    temp_dbx_path = ""
+    try:
+        import dropbox
+        dbx = dropbox.Dropbox(
+            app_key=app_key,
+            app_secret=app_secret,
+            oauth2_refresh_token=refresh_token
+        )
+
+        folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
+        folder_clean = "/" + folder.strip("/") if folder.strip("/") else ""
+        unique_name = f"temp_ig_{uuid.uuid4().hex[:8]}_{os.path.basename(local_video_path)}"
+        temp_dbx_path = f"{folder_clean}/{unique_name}"
+
+        logger.info(f"[Instagram] Subiendo video temporal a Dropbox: {temp_dbx_path}")
+        with open(local_video_path, "rb") as f:
+            dbx.files_upload(f.read(), temp_dbx_path, mode=dropbox.files.WriteMode.overwrite)
+
+        link_res = dbx.files_get_temporary_link(temp_dbx_path)
+        video_url = link_res.link
+        logger.info("[Instagram] Enlace temporal HTTPS de Dropbox generado correctamente")
+
+        # Crear contenedor en Instagram
+        create_url = f"https://graph.facebook.com/v21.0/{account_id}/media"
+        params = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "access_token": access_token
+        }
+        if caption:
+            params["caption"] = caption
+
+        encoded_data = urllib.parse.urlencode(params).encode("utf-8")
+        req = urllib.request.Request(create_url, data=encoded_data, method="POST")
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+            container_id = data.get("id")
+
+        if not container_id:
+            return False, "", "No se recibió creation_id del contenedor de Instagram"
+
+        logger.info(f"[Instagram] Contenedor creado en Meta: {container_id}. Esperando procesamiento...")
+
+        # Esperar procesamiento de Meta (polling hasta 120s)
+        status_url = f"https://graph.facebook.com/v21.0/{container_id}?fields=status_code,status&access_token={access_token}"
+        max_attempts = 24
+        ready = False
+
+        for i in range(max_attempts):
+            time.sleep(5)
+            with urllib.request.urlopen(status_url, timeout=30) as s_resp:
+                s_data = json.loads(s_resp.read().decode())
+                code = s_data.get("status_code")
+                logger.info(f"[Instagram] Estado del contenedor (intento {i+1}): {code}")
+                if code == "FINISHED":
+                    ready = True
+                    break
+                elif code == "ERROR":
+                    return False, "", f"Error de codificación en Meta: {s_data.get('status', 'Error desconocido')}"
+
+        if not ready:
+            return False, "", "Tiempo de espera agotado procesando el video en Instagram"
+
+        # Eliminar archivo temporal de Dropbox una vez descargado y procesado por Meta
+        try:
+            dbx.files_delete_v2(temp_dbx_path)
+            temp_dbx_path = ""
+            logger.info("[Instagram] Video temporal eliminado de Dropbox")
+        except Exception as e_del:
+            logger.warning(f"[Instagram] No se pudo eliminar archivo temporal de Dropbox: {e_del}")
+
+        # Modo Dry Run: no publicar al feed público
+        if dry_run:
+            logger.info("[Instagram] [DRY RUN] Video validado y listo. Omitiendo publicación en vivo.")
+            return True, "dry_run", "Validación completada con éxito (Modo Dry Run: no publicado en feed público)"
+
+        # Publicación real en vivo
+        publish_url = f"https://graph.facebook.com/v21.0/{account_id}/media_publish"
+        pub_params = {
+            "creation_id": container_id,
+            "access_token": access_token
+        }
+        pub_data = urllib.parse.urlencode(pub_params).encode("utf-8")
+        pub_req = urllib.request.Request(publish_url, data=pub_data, method="POST")
+
+        with urllib.request.urlopen(pub_req, timeout=60) as pub_resp:
+            pub_res = json.loads(pub_resp.read().decode())
+            media_id = pub_res.get("id")
+
+        if not media_id:
+            return False, "", "No se recibió media_id al publicar en Instagram"
+
+        # Obtener permalink
+        permalink = ""
+        try:
+            info_url = f"https://graph.facebook.com/v21.0/{media_id}?fields=permalink&access_token={access_token}"
+            with urllib.request.urlopen(info_url, timeout=30) as info_resp:
+                info_data = json.loads(info_resp.read().decode())
+                permalink = info_data.get("permalink", "")
+        except Exception:
+            pass
+
+        logger.info(f"[Instagram] Reel publicado exitosamente: {permalink or media_id}")
+        return True, permalink or media_id, "Publicado exitosamente en Instagram"
+
+    except Exception as e:
+        logger.error(f"[Instagram] Excepción en publish_video_to_instagram: {e}")
+        # Intentar limpiar archivo temporal si falló antes
+        if temp_dbx_path:
+            try:
+                dbx.files_delete_v2(temp_dbx_path)
+            except Exception:
+                pass
+        return False, "", str(e)
+
 async def control_vdo_panel(action_url: str) -> bool:
+
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
@@ -707,11 +850,13 @@ async def handle_video(client: Client, message: Message):
             deletions[file_id] = {
                 "ftp_path": target_folder,
                 "file_name": file_name,
-                "delete_after": None
+                "delete_after": None,
+                "caption": message.caption or ""
             }
             save_deletions(deletions)
             
             keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Publicar en Instagram", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
                 [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
                 [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
@@ -818,6 +963,117 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
         await callback_query.message.reply_text(f"🎵 ✅ **{count}/10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
     else:
         await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
+
+@app.on_callback_query(filters.regex(r"^ig_pub_"))
+async def handle_instagram_publish_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Solo administradores pueden publicar en Instagram.", show_alert=True)
+        return
+
+    data = callback_query.data
+    _, _, file_id = data.partition("ig_pub_")
+
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    file_name = info.get("file_name", "video.mp4")
+    caption = info.get("caption", "")
+
+    # Fallback si no tiene caption en deletions: buscar el caption del mensaje original o base del nombre
+    if not caption:
+        msg = callback_query.message
+        if msg.caption:
+            caption = msg.caption.split("🔔 **NUEVO VIDEO SUBIDO**")[0].strip()
+        if not caption:
+            caption = os.path.splitext(file_name)[0]
+
+    # Actualizar botón a estado procesando
+    current_markup = callback_query.message.reply_markup
+    processing_rows = []
+    if current_markup and current_markup.inline_keyboard:
+        for row in current_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                if btn.callback_data and btn.callback_data.startswith("ig_pub_"):
+                    new_row.append(InlineKeyboardButton("⏳ Procesando Instagram...", callback_data=f"noop_ig_{file_id}"))
+                else:
+                    new_row.append(btn)
+            processing_rows.append(new_row)
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(processing_rows))
+    except Exception:
+        pass
+
+    await callback_query.answer("🚀 Procesando publicación para Instagram...", show_alert=False)
+
+    temp_video_path = None
+    try:
+        # Descargar el video desde el mensaje de Telegram
+        status_msg = await callback_query.message.reply_text("⏳ Descargando video de Telegram para Instagram...")
+        temp_video_path = await callback_query.message.download()
+
+        await status_msg.edit_text("⏳ Conectando con Meta y procesando Reel...")
+        success, result, detail = await asyncio.to_thread(publish_video_to_instagram, temp_video_path, caption)
+
+        if success:
+            if result == "dry_run":
+                # Modo Dry-Run exitoso
+                btn_label = "✅ Validado (Dry Run)"
+                alert_text = (
+                    "🧪 **[Modo Simulación / Dry Run]**\n\n"
+                    "✅ El video fue enviado y procesado exitosamente por Instagram (Meta).\n"
+                    "Como el modo de prueba está activo, **NO** fue publicado en el feed público.\n\n"
+                    "💡 Cuando desees publicar directamente, avísame para desactivar el Dry Run."
+                )
+            else:
+                # Publicado en vivo exitosamente
+                btn_label = "✅ Publicado en IG"
+                alert_text = (
+                    f"📸 ✅ **¡Reel publicado exitosamente en Instagram!**\n\n"
+                    f"🔗 Enlace: {result}"
+                )
+
+            # Marcar botón de éxito
+            success_rows = []
+            if current_markup and current_markup.inline_keyboard:
+                for row in current_markup.inline_keyboard:
+                    new_row = []
+                    for btn in row:
+                        if btn.callback_data and btn.callback_data.startswith("ig_pub_"):
+                            new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_ig_{file_id}"))
+                        else:
+                            new_row.append(btn)
+                    success_rows.append(new_row)
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(success_rows))
+            except Exception:
+                pass
+
+            await status_msg.edit_text(alert_text)
+        else:
+            # Restaurar botón si falló
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=current_markup)
+            except Exception:
+                pass
+            await status_msg.edit_text(f"❌ **Error al procesar en Instagram:**\n`{detail}`")
+
+    except Exception as e:
+        logger.error(f"Error en callback de Instagram: {e}")
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=current_markup)
+        except Exception:
+            pass
+        await callback_query.message.reply_text(f"❌ Error inesperado: `{e}`")
+    finally:
+        if temp_video_path and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except Exception:
+                pass
+
+@app.on_callback_query(filters.regex(r"^noop_ig_"))
+async def handle_noop_ig_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer("Este video ya fue procesado para Instagram.", show_alert=True)
 
 @app.on_callback_query(filters.regex(r"^noop_"))
 async def handle_noop_callback(client: Client, callback_query: CallbackQuery):
