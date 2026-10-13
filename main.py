@@ -239,7 +239,33 @@ def upload_audio_to_dropbox(local_audio_path: str, dropbox_folder: str = None) -
         logger.error(f"Error al subir audio a Dropbox: {e}")
         return False
 
+def dropbox_delete_file(dropbox_file_path: str) -> bool:
+    """Elimina un archivo de Dropbox dada su ruta remota."""
+    app_key = os.getenv("DROPBOX_APP_KEY")
+    app_secret = os.getenv("DROPBOX_APP_SECRET")
+    refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN")
+    
+    if not (app_key and app_secret and refresh_token):
+        return False
+        
+    try:
+        import dropbox
+        dbx = dropbox.Dropbox(
+            app_key=app_key,
+            app_secret=app_secret,
+            oauth2_refresh_token=refresh_token
+        )
+        # Asegurar que la ruta comience con '/'
+        path_clean = "/" + dropbox_file_path.strip("/") if dropbox_file_path.strip("/") else dropbox_file_path
+        dbx.files_delete_v2(path_clean)
+        logger.info(f"Archivo de audio eliminado exitosamente de Dropbox: {path_clean}")
+        return True
+    except Exception as e:
+        logger.warning(f"No se pudo eliminar el archivo de audio de Dropbox ({dropbox_file_path}): {e}")
+        return False
+
 def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tuple[bool, str, str]:
+
     """
     Sube un video a Instagram Reels usando la API oficial Graph de Meta.
     Flujo:
@@ -818,12 +844,17 @@ async def handle_video(client: Client, message: Message):
         
         # 3. Extraer audio y subir a Dropbox si está configurado
         dropbox_uploaded = False
+        dropbox_audio_path = None
         try:
             base_name, _ = os.path.splitext(local_path)
             audio_path = f"{base_name}.mp3"
             if extract_audio_from_video(local_path, audio_path):
                 dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
                 dropbox_uploaded = await asyncio.to_thread(upload_audio_to_dropbox, audio_path, dropbox_folder)
+                if dropbox_uploaded:
+                    folder_clean = "/" + dropbox_folder.strip("/") if dropbox_folder.strip("/") else ""
+                    audio_filename = os.path.basename(audio_path)
+                    dropbox_audio_path = f"{folder_clean}/{audio_filename}"
                 if os.path.exists(audio_path):
                     os.remove(audio_path)
         except Exception as e_dbx:
@@ -853,7 +884,8 @@ async def handle_video(client: Client, message: Message):
                 "file_name": file_name,
                 "delete_after": None,
                 "caption": message.caption or "",
-                "telegram_file_id": tg_file_id
+                "telegram_file_id": tg_file_id,
+                "dropbox_audio_path": dropbox_audio_path
             }
             save_deletions(deletions)
             
@@ -1505,18 +1537,32 @@ def auto_delete_worker():
                     logger.info(f"Eliminando archivo caducado: {file_name} de {ftp_path}")
                     success = ftp_delete_file(ftp_path, file_name)
                     
-                    if success:
+                    # Eliminar también el audio correspondiente en Dropbox
+                    dbx_audio_path = info.get("dropbox_audio_path")
+                    if not dbx_audio_path:
+                        # Fallback: deducir ruta si no estaba explícita
+                        dbx_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA").strip("/")
+                        base_f, _ = os.path.splitext(file_name)
+                        dbx_audio_path = f"/{dbx_folder}/{base_f}.mp3"
+                    
+                    dbx_deleted = dropbox_delete_file(dbx_audio_path)
+                    
+                    if success or dbx_deleted:
                         for admin_chat_id in ADMIN_CHAT_IDS:
                             try:
+                                msg_text = f"🗑️ **Autodestrucción Ejecutada**\nEl archivo `{file_name}` ha sido eliminado del FTP."
+                                if dbx_deleted:
+                                    msg_text += f"\n🎵 Audio `{os.path.basename(dbx_audio_path)}` eliminado de Dropbox."
                                 asyncio.run_coroutine_threadsafe(
                                     app.send_message(
                                         chat_id=admin_chat_id,
-                                        text=f"🗑️ **Autodestrucción Ejecutada**\nEl archivo `{file_name}` ha sido eliminado del FTP por haber cumplido su fecha de caducidad."
+                                        text=msg_text
                                     ),
                                     loop
                                 )
                             except Exception as e:
                                 logger.error(f"Error enviando notif de borrado a admin {admin_chat_id}: {e}")
+
                                 
                     del deletions[file_id]
                     modified = True
