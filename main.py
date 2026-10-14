@@ -428,56 +428,55 @@ def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tupl
                 pass
         return False, "", str(e)
 
-async def trigger_active_scheduler(session: aiohttp.ClientSession) -> bool:
-    """Dispara/actualiza el programador activo continuo para forzar el arranque del streaming de video."""
+async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int = 17) -> bool:
+    """Asegura que el programador de la playlist esté activado (run_status = 1) en VDO Panel."""
     try:
-        sched_edit_url = None
-        async with session.get("https://stream.conexion.com.ve/broadcaster/scheduler") as resp:
-            if resp.status == 200:
-                s_html = await resp.text()
-                m = re.search(r'href="([^"]*scheduler/\d+/edit)"', s_html)
-                if m:
-                    sched_edit_url = m.group(1)
-        if not sched_edit_url:
-            sched_edit_url = "https://stream.conexion.com.ve/broadcaster/scheduler/17/edit"
-            
-        async with session.get(sched_edit_url) as resp:
+        sched_url = "https://stream.conexion.com.ve/broadcaster/scheduler"
+        async with session.get(sched_url) as resp:
             if resp.status != 200:
                 return False
             html = await resp.text()
             
         soup = BeautifulSoup(html, 'html.parser')
-        form = soup.find('form')
-        if not form:
+        token = None
+        for inp in soup.find_all('input', type='hidden'):
+            if inp.get('name') == '_token':
+                token = inp.get('value')
+                break
+                
+        input_sched = soup.find('input', {'class': 'changeSchedStatus'})
+        if input_sched and input_sched.get('data-sched-id'):
+            try:
+                sched_id = int(input_sched.get('data-sched-id'))
+            except Exception:
+                pass
+                
+        if not token:
+            for sc in soup.find_all('script'):
+                if sc.string and '_token' in sc.string:
+                    m = re.search(r"_token:\s*'([^']+)'", sc.string)
+                    if m:
+                        token = m.group(1)
+                        break
+                        
+        if not token:
             return False
             
-        update_url = form.get('action') or 'https://stream.conexion.com.ve/broadcaster/scheduler/update'
-        payload = []
-        for inp in form.find_all('input'):
-            n = inp.get('name')
-            v = inp.get('value', '')
-            if n:
-                payload.append((n, v))
-                
-        for sel in form.find_all('select'):
-            n = sel.get('name')
-            if not n:
-                continue
-            selected_opts = [o.get('value') for o in sel.find_all('option') if o.has_attr('selected')]
-            if not selected_opts and sel.find_all('option'):
-                selected_opts = [sel.find_all('option')[0].get('value')]
-            for opt in selected_opts:
-                payload.append((n, opt))
-                
-        headers = {
-            'Referer': sched_edit_url,
-            'Origin': 'https://stream.conexion.com.ve',
-            'Content-Type': 'application/x-www-form-urlencoded'
+        post_data = {
+            'sched_id': str(sched_id),
+            'run_status': '1',
+            '_token': token
         }
-        async with session.post(update_url, data=payload, headers=headers) as resp:
-            return resp.status in [200, 302]
+        headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': sched_url,
+            'Origin': 'https://stream.conexion.com.ve'
+        }
+        async with session.post("https://stream.conexion.com.ve/broadcaster/change-schedule-run-status", data=post_data, headers=headers) as resp:
+            logger.info(f"Activación de scheduler {sched_id} (run_status=1): HTTP {resp.status}")
+            return resp.status == 200
     except Exception as e:
-        logger.error(f"Error disparando scheduler activo: {e}")
+        logger.error(f"Error activando scheduler run status: {e}")
         return False
 
 async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
@@ -513,54 +512,62 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False, f"❌ Fallo al autenticar en VDO Panel (HTTP {resp.status})."
                     
-            # 2. Ejecutar la acción solicitada
+            # 2. Manejo según acción
+            if action_type == "stop":
+                headers = {
+                    "Referer": "https://stream.conexion.com.ve/broadcaster",
+                    "User-Agent": "Mozilla/5.0"
+                }
+                async with session.get(action_url, headers=headers) as resp:
+                    if resp.status not in [200, 301, 302]:
+                        return False, f"❌ Error del servidor VDO Panel al detener emisión (HTTP {resp.status})."
+                        
+                # Polling para verificar que pasó a Offline
+                for _ in range(5):
+                    await asyncio.sleep(2)
+                    async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            if isinstance(data, dict):
+                                st = data.get("options", {}).get("status_name", "")
+                                if str(st).lower() == "offline":
+                                    return True, "✅ Stream **DETENIDO** exitosamente.\n\n🔴 **Estado:** `Offline`"
+                return True, "✅ Orden de detención procesada exitosamente en VDO Panel."
+                
+            # Para start o restart:
+            # Primero: Habilitar el programador continuo (run_status = 1)
+            logger.info("Asegurando activación del programador continuo en VDO Panel...")
+            await activate_vdo_scheduler(session)
+            
+            # Segundo: Iniciar/reiniciar el servicio
             headers = {
                 "Referer": "https://stream.conexion.com.ve/broadcaster",
                 "User-Agent": "Mozilla/5.0"
             }
             async with session.get(action_url, headers=headers) as resp:
                 if resp.status not in [200, 301, 302]:
-                    return False, f"❌ Error del servidor VDO Panel al ejecutar acción (HTTP {resp.status})."
+                    return False, f"❌ Error del servidor VDO Panel al iniciar emisión (HTTP {resp.status})."
                     
-            # 3. Manejo y validación según acción
-            if action_type == "stop":
-                await asyncio.sleep(2)
-                async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        opts = data.get("options", {})
-                        st = opts.get("status_name", "Offline")
-                        if str(st).lower() == "offline":
-                            return True, "✅ Stream **DETENIDO** exitosamente.\n\n🔴 **Estado:** `Offline`"
-                return True, "✅ Orden de detención procesada exitosamente en VDO Panel."
-                
-            # Para start o restart:
-            await asyncio.sleep(2)
-            curr_status = "Offline"
+            # Tercero: Sondeo de verificación de emisión en vivo (hasta 12 segundos)
+            is_live = False
             curr_opts = {}
-            async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    curr_opts = data.get("options", {})
-                    curr_status = curr_opts.get("status_name", "Offline")
-                    
-            # Si aún no está en 'Live', forzar el arranque mediante el scheduler continuo
-            if str(curr_status).lower() != "live":
-                logger.info("El demonio arrancó pero el stream está Offline. Disparando scheduler activo...")
-                await trigger_active_scheduler(session)
+            for attempt in range(6):
                 await asyncio.sleep(2)
                 async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
-                        curr_opts = data.get("options", {})
-                        curr_status = curr_opts.get("status_name", "Offline")
-                        
-            is_live = str(curr_status).lower() == "live"
-            pl_name = curr_opts.get("playli_stname", "MUSICALNEW")
-            vid_name = curr_opts.get("video_name", "En cola")
-            
+                        if isinstance(data, dict):
+                            curr_opts = data.get("options", {})
+                            if isinstance(curr_opts, dict):
+                                curr_status = curr_opts.get("status_name", "Offline")
+                                if str(curr_status).lower() == "live":
+                                    is_live = True
+                                    break
+                                    
             act_word = "INICIADO" if action_type == "start" else "REINICIADO"
             if is_live:
+                pl_name = curr_opts.get("playli_stname", "MUSICALNEW")
+                vid_name = curr_opts.get("video_name", "En cola")
                 return True, (
                     f"✅ Stream **{act_word}** exitosamente y emitiendo en vivo.\n\n"
                     f"🟢 **Estado:** `Live`\n"
@@ -568,10 +575,14 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                     f"🎬 **Video actual:** `{vid_name}`"
                 )
             else:
+                curr_status = curr_opts.get("status_name", "Offline") if curr_opts else "Offline"
                 return False, (
                     f"⚠️ El servicio fue ordenado a iniciar pero VDO Panel reporta estado: `{curr_status}`.\n"
                     f"Por favor verifica si la lista o el codificador de video tienen algún bloqueo en el panel."
                 )
+    except Exception as e:
+        logger.error(f"Excepción en control_vdo_panel: {e}")
+        return False, f"❌ Excepción técnica al comunicar con VDO Panel: {e}"
     except Exception as e:
         logger.error(f"Excepción en control_vdo_panel: {e}")
         return False, f"❌ Excepción técnica al comunicar con VDO Panel: {e}"
