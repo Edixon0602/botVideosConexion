@@ -8,6 +8,8 @@ import threading
 import urllib.request
 import urllib.parse
 import time
+import re
+import unicodedata
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -145,8 +147,27 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitiza un nombre de archivo para compatibilidad con FTP, Linux y VDO Panel:
+    - Normaliza unicode para remover acentos y tildes.
+    - Reemplaza espacios, paréntesis y caracteres especiales por guiones.
+    - Colapsa múltiples guiones consecutivos.
+    """
+    if not filename:
+        return "video.mp4"
+    base, ext = os.path.splitext(filename)
+    base = unicodedata.normalize('NFKD', base).encode('ascii', 'ignore').decode('ascii')
+    base = re.sub(r'[^a-zA-Z0-9_-]', '-', base)
+    base = re.sub(r'-+', '-', base).strip('-')
+    if not base:
+        base = "video"
+    ext = ext.lower() if ext else ".mp4"
+    return f"{base}{ext}"
+
 def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str):
     """Sube un archivo al servidor FTP en la carpeta específica"""
+    remote_filename = sanitize_filename(remote_filename)
     logger.info(f"Conectando a FTP: {FTP_HOST}...")
     ftp = FTP(FTP_HOST)
     ftp.login(user=FTP_USER, passwd=FTP_PASS)
@@ -407,60 +428,153 @@ def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tupl
                 pass
         return False, "", str(e)
 
-async def control_vdo_panel(action_url: str) -> bool:
+async def trigger_active_scheduler(session: aiohttp.ClientSession) -> bool:
+    """Dispara/actualiza el programador activo continuo para forzar el arranque del streaming de video."""
+    try:
+        sched_edit_url = None
+        async with session.get("https://stream.conexion.com.ve/broadcaster/scheduler") as resp:
+            if resp.status == 200:
+                s_html = await resp.text()
+                m = re.search(r'href="([^"]*scheduler/\d+/edit)"', s_html)
+                if m:
+                    sched_edit_url = m.group(1)
+        if not sched_edit_url:
+            sched_edit_url = "https://stream.conexion.com.ve/broadcaster/scheduler/17/edit"
+            
+        async with session.get(sched_edit_url) as resp:
+            if resp.status != 200:
+                return False
+            html = await resp.text()
+            
+        soup = BeautifulSoup(html, 'html.parser')
+        form = soup.find('form')
+        if not form:
+            return False
+            
+        update_url = form.get('action') or 'https://stream.conexion.com.ve/broadcaster/scheduler/update'
+        payload = []
+        for inp in form.find_all('input'):
+            n = inp.get('name')
+            v = inp.get('value', '')
+            if n:
+                payload.append((n, v))
+                
+        for sel in form.find_all('select'):
+            n = sel.get('name')
+            if not n:
+                continue
+            selected_opts = [o.get('value') for o in sel.find_all('option') if o.has_attr('selected')]
+            if not selected_opts and sel.find_all('option'):
+                selected_opts = [sel.find_all('option')[0].get('value')]
+            for opt in selected_opts:
+                payload.append((n, opt))
+                
+        headers = {
+            'Referer': sched_edit_url,
+            'Origin': 'https://stream.conexion.com.ve',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        async with session.post(update_url, data=payload, headers=headers) as resp:
+            return resp.status in [200, 302]
+    except Exception as e:
+        logger.error(f"Error disparando scheduler activo: {e}")
+        return False
 
+async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
     if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
         logger.error("Credenciales de VDO Panel no configuradas.")
-        return False
+        return False, "❌ Credenciales de VDO Panel no configuradas en el entorno."
+        
+    action_type = "start"
+    if "stop" in action_url.lower():
+        action_type = "stop"
+    elif "restart" in action_url.lower():
+        action_type = "restart"
         
     login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    ajax_url = "https://stream.conexion.com.ve/broadcaster/ajax-get-current-running"
     
     try:
-        # Usamos una sesión para guardar las cookies automáticamente
         async with aiohttp.ClientSession() as session:
-            # 1. Obtener la página de login para sacar el CSRF token y cookies iniciales
+            # 1. Login
             async with session.get(login_url) as resp:
                 html = await resp.text()
-                
             soup = BeautifulSoup(html, 'html.parser')
-            
-            payload = {
-                "name": vdo_user,
-                "password": vdo_pass
-            }
-            
-            # Extraer campos ocultos (como _token de Laravel)
+            payload = {"name": vdo_user, "password": vdo_pass}
             for hidden in soup.find_all("input", type="hidden"):
-                name = hidden.get("name")
-                value = hidden.get("value")
-                if name:
-                    payload[name] = value
+                if hidden.get("name"):
+                    payload[hidden.get("name")] = hidden.get("value")
                     
-            # 2. Hacer POST al login
             async with session.post(login_url, data=payload) as resp:
-                # Laravel suele redirigir (302) si el login fue exitoso. 
-                # aiohttp sigue las redirecciones por defecto, por lo que debería darnos un 200 en el dashboard
                 if resp.status not in [200, 302] or str(resp.url).endswith("/login"):
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
-                    return False
-                
-            # 3. Ejecutar la acción solicitada (start, stop o restart)
+                    return False, f"❌ Fallo al autenticar en VDO Panel (HTTP {resp.status})."
+                    
+            # 2. Ejecutar la acción solicitada
             headers = {
                 "Referer": "https://stream.conexion.com.ve/broadcaster",
                 "User-Agent": "Mozilla/5.0"
             }
             async with session.get(action_url, headers=headers) as resp:
-                if resp.status in [200, 302, 301]:
-                    return True
-                else:
-                    logger.error(f"Fallo al ejecutar la acción en VDO Panel: HTTP {resp.status}")
-                    return False
+                if resp.status not in [200, 301, 302]:
+                    return False, f"❌ Error del servidor VDO Panel al ejecutar acción (HTTP {resp.status})."
+                    
+            # 3. Manejo y validación según acción
+            if action_type == "stop":
+                await asyncio.sleep(2)
+                async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        opts = data.get("options", {})
+                        st = opts.get("status_name", "Offline")
+                        if str(st).lower() == "offline":
+                            return True, "✅ Stream **DETENIDO** exitosamente.\n\n🔴 **Estado:** `Offline`"
+                return True, "✅ Orden de detención procesada exitosamente en VDO Panel."
+                
+            # Para start o restart:
+            await asyncio.sleep(2)
+            curr_status = "Offline"
+            curr_opts = {}
+            async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    curr_opts = data.get("options", {})
+                    curr_status = curr_opts.get("status_name", "Offline")
+                    
+            # Si aún no está en 'Live', forzar el arranque mediante el scheduler continuo
+            if str(curr_status).lower() != "live":
+                logger.info("El demonio arrancó pero el stream está Offline. Disparando scheduler activo...")
+                await trigger_active_scheduler(session)
+                await asyncio.sleep(2)
+                async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        curr_opts = data.get("options", {})
+                        curr_status = curr_opts.get("status_name", "Offline")
+                        
+            is_live = str(curr_status).lower() == "live"
+            pl_name = curr_opts.get("playli_stname", "MUSICALNEW")
+            vid_name = curr_opts.get("video_name", "En cola")
+            
+            act_word = "INICIADO" if action_type == "start" else "REINICIADO"
+            if is_live:
+                return True, (
+                    f"✅ Stream **{act_word}** exitosamente y emitiendo en vivo.\n\n"
+                    f"🟢 **Estado:** `Live`\n"
+                    f"📋 **Playlist:** `{pl_name}`\n"
+                    f"🎬 **Video actual:** `{vid_name}`"
+                )
+            else:
+                return False, (
+                    f"⚠️ El servicio fue ordenado a iniciar pero VDO Panel reporta estado: `{curr_status}`.\n"
+                    f"Por favor verifica si la lista o el codificador de video tienen algún bloqueo en el panel."
+                )
     except Exception as e:
         logger.error(f"Excepción en control_vdo_panel: {e}")
-        return False
+        return False, f"❌ Excepción técnica al comunicar con VDO Panel: {e}"
 
 async def get_vdo_stream_status() -> dict | None:
     vdo_user = os.getenv("VDOPANEL_USER")
@@ -567,33 +681,40 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 return False, 0
                 
             # Resolver inteligentemente los 10 nombres exactos presentes en el FileManager
+            name, ext = os.path.splitext(file_name)
+            sanitized_name = sanitize_filename(file_name)
+            s_name, s_ext = os.path.splitext(sanitized_name)
+            
+            expected_copies = [s_name + s_ext] + [f"{s_name}-{i}{s_ext}" for i in range(1, 10)]
             resolved_files = []
-            for i in range(10):
-                if i == 0:
-                    candidates = [
-                        file_name,
-                        file_name.replace("_", "-"),
-                        file_name.replace("-", "_"),
-                        file_name.replace(" ", "-"),
-                        file_name.replace(" ", "_")
-                    ]
+            
+            for i, exp in enumerate(expected_copies):
+                if exp in existing_fm_files:
+                    resolved_files.append(exp)
                 else:
-                    candidates = [
-                        f"{name}-{i}{ext}",
-                        f"{name.replace('_', '-')}-{i}{ext}",
-                        f"{name.replace('-', '_')}-{i}{ext}",
-                        f"{name}_{i}{ext}",
-                        f"{name.replace('_', '-')}_{i}{ext}"
-                    ]
-                
-                chosen = None
-                for c in candidates:
-                    if c in existing_fm_files:
-                        chosen = c
-                        break
-                if not chosen:
-                    chosen = candidates[0]
-                resolved_files.append(chosen)
+                    cand = None
+                    raw_target = file_name if i == 0 else f"{name}-{i}{ext}"
+                    for alt in [
+                        raw_target,
+                        raw_target.replace(" ", "-"),
+                        raw_target.replace(" ", "_"),
+                        raw_target.replace("_", "-"),
+                        raw_target.replace("-", "_")
+                    ]:
+                        if alt in existing_fm_files:
+                            cand = alt
+                            break
+                            
+                    if not cand:
+                        for ef in existing_fm_files:
+                            if i == 0 and (ef == s_name + s_ext or ef.startswith(s_name)):
+                                cand = ef
+                                break
+                            elif i > 0 and (ef == f"{s_name}-{i}{s_ext}" or ef.endswith(f"-{i}{s_ext}")):
+                                cand = ef
+                                break
+                                
+                    resolved_files.append(cand if cand else exp)
                 
             # 3. POST a filemanager/batch (Paso 1 del batch)
             root_path = f"/home/{vdo_user}/uploads/{folder_clean}" if folder_clean else f"/home/{vdo_user}/uploads"
@@ -690,13 +811,9 @@ async def cmd_start_stream(client: Client, message: Message):
         await message.reply_text("❌ No estás autorizado para controlar el stream.")
         return
         
-    msg = await message.reply_text("⏳ Intentando **INICIAR** el stream en VDO Panel...")
-    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-serv-confirm")
-    
-    if success:
-        await msg.edit_text("✅ Stream **INICIADO** exitosamente.")
-    else:
-        await msg.edit_text("❌ Error al iniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+    msg = await message.reply_text("⏳ Intentando **INICIAR** el stream en VDO Panel y sincronizar la programación...")
+    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-serv-confirm")
+    await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("detener") & filters.private)
 async def cmd_stop_stream(client: Client, message: Message):
@@ -710,12 +827,8 @@ async def cmd_stop_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **DETENER** el stream en VDO Panel...")
-    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm")
-    
-    if success:
-        await msg.edit_text("✅ Stream **DETENIDO** exitosamente.")
-    else:
-        await msg.edit_text("❌ Error al detener el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm")
+    await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("reiniciar") & filters.private)
 async def cmd_restart_stream(client: Client, message: Message):
@@ -728,13 +841,9 @@ async def cmd_restart_stream(client: Client, message: Message):
         await message.reply_text("❌ No estás autorizado para controlar el stream.")
         return
         
-    msg = await message.reply_text("⏳ Intentando **REINICIAR** el stream en VDO Panel...")
-    success = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/restart-serv-confirm")
-    
-    if success:
-        await msg.edit_text("✅ Stream **REINICIADO** exitosamente.")
-    else:
-        await msg.edit_text("❌ Error al reiniciar el stream. Revisa las credenciales de VDO Panel en las variables de entorno.")
+    msg = await message.reply_text("⏳ Intentando **REINICIAR** el stream en VDO Panel y sincronizar la programación...")
+    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/restart-serv-confirm")
+    await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("estado") & filters.private)
 async def cmd_status_stream(client: Client, message: Message):
@@ -824,7 +933,8 @@ async def handle_video(client: Client, message: Message):
         return
         
     file_size_mb = file.file_size / (1024 * 1024)
-    file_name = file.file_name if getattr(file, 'file_name', None) else f"video_{message.id}.mp4"
+    raw_file_name = file.file_name if getattr(file, 'file_name', None) else f"video_{message.id}.mp4"
+    file_name = sanitize_filename(raw_file_name)
     
     # Mensaje de estado
     status_msg = await message.reply_text(f"¡Hola {user_name}! ⏳ Descargando `{file_name}` ({file_size_mb:.2f} MB)...")
@@ -1482,7 +1592,17 @@ def ftp_delete_file(target_folder, file_name):
                 return False
                 
         name, ext = os.path.splitext(file_name)
-        base_names = {name, name.replace("_", "-"), name.replace("-", "_")}
+        s_name, s_ext = os.path.splitext(sanitize_filename(file_name))
+        base_names = {
+            name,
+            name.replace("_", "-"),
+            name.replace("-", "_"),
+            name.replace(" ", "-"),
+            name.replace(" ", "_"),
+            s_name,
+            s_name.replace("_", "-"),
+            s_name.replace("-", "_")
+        }
         
         deleted_count = 0
         existing_files = set()
