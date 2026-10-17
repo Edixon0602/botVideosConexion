@@ -285,34 +285,54 @@ def dropbox_delete_file(dropbox_file_path: str) -> bool:
         logger.warning(f"No se pudo eliminar el archivo de audio de Dropbox ({dropbox_file_path}): {e}")
         return False
 
-def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tuple[bool, str, str]:
-
+def publish_video_to_meta(local_video_path: str, caption: str = "") -> dict:
     """
-    Sube un video a Instagram Reels usando la API oficial Graph de Meta.
+    Sube un video de forma simultánea a Instagram Reels y a la Página de Facebook usando Meta Graph API.
     Flujo:
     1. Sube video temporalmente a Dropbox para obtener un enlace público HTTPS directo.
-    2. Crea contenedor de video en Instagram Graph API (POST /{ig_user_id}/media).
-    3. Espera a que Meta procese el video (polling de status_code == FINISHED).
-    4. Limpia el archivo temporal en Dropbox.
-    5. Si INSTAGRAM_DRY_RUN es True, no publica en el feed (simulación completada con éxito).
-       Si es False, publica en vivo (POST /{ig_user_id}/media_publish) y retorna permalink.
-    Retorna: (éxito, permalink_o_status, mensaje_detalle)
+    2. En Instagram:
+       - Crea contenedor en Instagram Graph API (POST /{ig_user_id}/media con media_type=REELS).
+       - Espera que Meta codifique el video (polling status_code == FINISHED).
+       - Publica (POST /{ig_user_id}/media_publish) y obtiene permalink.
+    3. En Facebook:
+       - Obtiene el Page Access Token (PAT) del Fanpage mediante GET /{page_id}?fields=access_token.
+       - Sube el video directamente a la Página (POST /{page_id}/videos) con file_url, description y title.
+       - Obtiene el permalink o id del post de Facebook.
+    4. Limpia el archivo temporal de Dropbox.
+    Retorna un diccionario estructurado:
+    {
+        "instagram": {"success": bool, "permalink": str, "error": str},
+        "facebook": {"success": bool, "permalink": str, "error": str}
+    }
     """
-    account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
-    access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+    results = {
+        "instagram": {"success": False, "permalink": "", "error": ""},
+        "facebook": {"success": False, "permalink": "", "error": ""}
+    }
+
+    ig_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
+    fb_page_id = os.getenv("FB_PAGE_ID", "116061275124689")
+    meta_token = os.getenv("META_ACCESS_TOKEN") or os.getenv("INSTAGRAM_ACCESS_TOKEN")
     dry_run = os.getenv("INSTAGRAM_DRY_RUN", "False").lower() in ("true", "1", "yes")
 
-    if not account_id or not access_token:
-        return False, "", "Credenciales de Instagram no configuradas en .env"
+    if not meta_token:
+        err = "Token de Meta (META_ACCESS_TOKEN) no configurado en .env"
+        results["instagram"]["error"] = err
+        results["facebook"]["error"] = err
+        return results
 
     app_key = os.getenv("DROPBOX_APP_KEY")
     app_secret = os.getenv("DROPBOX_APP_SECRET")
     refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN")
 
     if not (app_key and app_secret and refresh_token):
-        return False, "", "Credenciales de Dropbox requeridas para generar enlace público temporal"
+        err = "Credenciales de Dropbox requeridas para generar enlace público temporal"
+        results["instagram"]["error"] = err
+        results["facebook"]["error"] = err
+        return results
 
     temp_dbx_path = ""
+    dbx = None
     try:
         import dropbox
         dbx = dropbox.Dropbox(
@@ -323,113 +343,175 @@ def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tupl
 
         folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
         folder_clean = "/" + folder.strip("/") if folder.strip("/") else ""
-        unique_name = f"temp_ig_{uuid.uuid4().hex[:8]}_{os.path.basename(local_video_path)}"
+        unique_name = f"temp_meta_{uuid.uuid4().hex[:8]}_{os.path.basename(local_video_path)}"
         temp_dbx_path = f"{folder_clean}/{unique_name}"
 
-        logger.info(f"[Instagram] Subiendo video temporal a Dropbox: {temp_dbx_path}")
+        logger.info(f"[Meta] Subiendo video temporal a Dropbox: {temp_dbx_path}")
         with open(local_video_path, "rb") as f:
             dbx.files_upload(f.read(), temp_dbx_path, mode=dropbox.files.WriteMode.overwrite)
 
         link_res = dbx.files_get_temporary_link(temp_dbx_path)
         video_url = link_res.link
-        logger.info("[Instagram] Enlace temporal HTTPS de Dropbox generado correctamente")
+        logger.info("[Meta] Enlace temporal HTTPS de Dropbox generado correctamente")
 
-        # Crear contenedor en Instagram
-        create_url = f"https://graph.facebook.com/v21.0/{account_id}/media"
-        params = {
-            "media_type": "REELS",
-            "video_url": video_url,
-            "access_token": access_token
-        }
-        if caption:
-            params["caption"] = caption
+        # --- 1. PUBLICACIÓN EN INSTAGRAM REELS ---
+        if ig_account_id:
+            try:
+                logger.info(f"[Instagram] Iniciando publicación en cuenta {ig_account_id}...")
+                create_url = f"https://graph.facebook.com/v21.0/{ig_account_id}/media"
+                ig_params = {
+                    "media_type": "REELS",
+                    "video_url": video_url,
+                    "access_token": meta_token
+                }
+                if caption:
+                    ig_params["caption"] = caption
 
-        encoded_data = urllib.parse.urlencode(params).encode("utf-8")
-        req = urllib.request.Request(create_url, data=encoded_data, method="POST")
+                encoded_ig = urllib.parse.urlencode(ig_params).encode("utf-8")
+                ig_req = urllib.request.Request(create_url, data=encoded_ig, method="POST")
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode())
-            container_id = data.get("id")
+                with urllib.request.urlopen(ig_req, timeout=60) as resp:
+                    ig_data = json.loads(resp.read().decode())
+                    container_id = ig_data.get("id")
 
-        if not container_id:
-            return False, "", "No se recibió creation_id del contenedor de Instagram"
+                if not container_id:
+                    results["instagram"]["error"] = "No se recibió creation_id del contenedor de Instagram"
+                else:
+                    logger.info(f"[Instagram] Contenedor creado: {container_id}. Verificando procesamiento...")
+                    status_url = f"https://graph.facebook.com/v21.0/{container_id}?fields=status_code,status&access_token={meta_token}"
+                    ready = False
+                    for i in range(24):
+                        time.sleep(5)
+                        with urllib.request.urlopen(status_url, timeout=30) as s_resp:
+                            s_data = json.loads(s_resp.read().decode())
+                            code = s_data.get("status_code")
+                            logger.info(f"[Instagram] Estado del contenedor (intento {i+1}): {code}")
+                            if code == "FINISHED":
+                                ready = True
+                                break
+                            elif code == "ERROR":
+                                results["instagram"]["error"] = f"Error codificación Meta: {s_data.get('status', 'Error desconocido')}"
+                                break
 
-        logger.info(f"[Instagram] Contenedor creado en Meta: {container_id}. Esperando procesamiento...")
+                    if not ready and not results["instagram"]["error"]:
+                        results["instagram"]["error"] = "Tiempo de espera agotado procesando Reel en Instagram"
+                    elif ready:
+                        if dry_run:
+                            logger.info("[Instagram] [DRY RUN] Reel listo. Omitiendo publicación en vivo.")
+                            results["instagram"]["success"] = True
+                            results["instagram"]["permalink"] = "dry_run"
+                        else:
+                            pub_url = f"https://graph.facebook.com/v21.0/{ig_account_id}/media_publish"
+                            pub_params = {
+                                "creation_id": container_id,
+                                "access_token": meta_token
+                            }
+                            pub_data = urllib.parse.urlencode(pub_params).encode("utf-8")
+                            pub_req = urllib.request.Request(pub_url, data=pub_data, method="POST")
+                            with urllib.request.urlopen(pub_req, timeout=60) as pub_resp:
+                                pub_res = json.loads(pub_resp.read().decode())
+                                media_id = pub_res.get("id")
 
-        # Esperar procesamiento de Meta (polling hasta 120s)
-        status_url = f"https://graph.facebook.com/v21.0/{container_id}?fields=status_code,status&access_token={access_token}"
-        max_attempts = 24
-        ready = False
+                            if not media_id:
+                                results["instagram"]["error"] = "No se recibió media_id al publicar en Instagram"
+                            else:
+                                permalink = ""
+                                try:
+                                    info_url = f"https://graph.facebook.com/v21.0/{media_id}?fields=permalink&access_token={meta_token}"
+                                    with urllib.request.urlopen(info_url, timeout=30) as info_resp:
+                                        info_data = json.loads(info_resp.read().decode())
+                                        permalink = info_data.get("permalink", "")
+                                except Exception:
+                                    pass
+                                results["instagram"]["success"] = True
+                                results["instagram"]["permalink"] = permalink or f"https://instagram.com/p/{media_id}"
+                                logger.info(f"[Instagram] Reel publicado con éxito: {results['instagram']['permalink']}")
+            except Exception as e_ig:
+                logger.error(f"[Instagram] Error publicando Reel: {e_ig}")
+                results["instagram"]["error"] = str(e_ig)
+        else:
+            results["instagram"]["error"] = "INSTAGRAM_ACCOUNT_ID no configurado"
 
-        for i in range(max_attempts):
-            time.sleep(5)
-            with urllib.request.urlopen(status_url, timeout=30) as s_resp:
-                s_data = json.loads(s_resp.read().decode())
-                code = s_data.get("status_code")
-                logger.info(f"[Instagram] Estado del contenedor (intento {i+1}): {code}")
-                if code == "FINISHED":
-                    ready = True
-                    break
-                elif code == "ERROR":
-                    return False, "", f"Error de codificación en Meta: {s_data.get('status', 'Error desconocido')}"
+        # --- 2. PUBLICACIÓN EN PÁGINA DE FACEBOOK ---
+        if fb_page_id:
+            try:
+                logger.info(f"[Facebook] Obteniendo Page Access Token para página {fb_page_id}...")
+                page_token_url = f"https://graph.facebook.com/v21.0/{fb_page_id}?fields=access_token&access_token={meta_token}"
+                page_access_token = meta_token
+                try:
+                    with urllib.request.urlopen(page_token_url, timeout=30) as pt_resp:
+                        pt_data = json.loads(pt_resp.read().decode())
+                        page_access_token = pt_data.get("access_token", meta_token)
+                except Exception as e_pat:
+                    logger.warning(f"[Facebook] No se pudo obtener PAT dedicado ({e_pat}), usando token principal.")
 
-        if not ready:
-            return False, "", "Tiempo de espera agotado procesando el video en Instagram"
+                logger.info(f"[Facebook] Publicando video en Página {fb_page_id}...")
+                fb_video_url = f"https://graph.facebook.com/v21.0/{fb_page_id}/videos"
+                
+                # Derivar título breve si hay caption
+                fb_title = ""
+                if caption:
+                    first_line = caption.strip().split("\n")[0]
+                    fb_title = first_line[:90]
 
-        # Eliminar archivo temporal de Dropbox una vez descargado y procesado por Meta
-        try:
-            dbx.files_delete_v2(temp_dbx_path)
-            temp_dbx_path = ""
-            logger.info("[Instagram] Video temporal eliminado de Dropbox")
-        except Exception as e_del:
-            logger.warning(f"[Instagram] No se pudo eliminar archivo temporal de Dropbox: {e_del}")
+                fb_params = {
+                    "file_url": video_url,
+                    "description": caption or "",
+                    "access_token": page_access_token
+                }
+                if fb_title:
+                    fb_params["title"] = fb_title
 
-        # Modo Dry Run: no publicar al feed público
-        if dry_run:
-            logger.info("[Instagram] [DRY RUN] Video validado y listo. Omitiendo publicación en vivo.")
-            return True, "dry_run", "Validación completada con éxito (Modo Dry Run: no publicado en feed público)"
+                if dry_run:
+                    logger.info("[Facebook] [DRY RUN] Video validado. Omitiendo publicación en página pública.")
+                    results["facebook"]["success"] = True
+                    results["facebook"]["permalink"] = "dry_run"
+                else:
+                    fb_data_encoded = urllib.parse.urlencode(fb_params).encode("utf-8")
+                    fb_req = urllib.request.Request(fb_video_url, data=fb_data_encoded, method="POST")
+                    with urllib.request.urlopen(fb_req, timeout=60) as fb_resp:
+                        fb_res = json.loads(fb_resp.read().decode())
+                        fb_video_id = fb_res.get("id")
 
-        # Publicación real en vivo
-        publish_url = f"https://graph.facebook.com/v21.0/{account_id}/media_publish"
-        pub_params = {
-            "creation_id": container_id,
-            "access_token": access_token
-        }
-        pub_data = urllib.parse.urlencode(pub_params).encode("utf-8")
-        pub_req = urllib.request.Request(publish_url, data=pub_data, method="POST")
+                    if fb_video_id:
+                        results["facebook"]["success"] = True
+                        results["facebook"]["permalink"] = f"https://www.facebook.com/{fb_video_id}"
+                        logger.info(f"[Facebook] Video publicado exitosamente en Facebook: {results['facebook']['permalink']}")
+                    else:
+                        results["facebook"]["error"] = "No se recibió id de video de Facebook"
+            except Exception as e_fb:
+                logger.error(f"[Facebook] Error publicando video en Facebook: {e_fb}")
+                results["facebook"]["error"] = str(e_fb)
+        else:
+            results["facebook"]["error"] = "FB_PAGE_ID no configurado"
 
-        with urllib.request.urlopen(pub_req, timeout=60) as pub_resp:
-            pub_res = json.loads(pub_resp.read().decode())
-            media_id = pub_res.get("id")
-
-        if not media_id:
-            return False, "", "No se recibió media_id al publicar en Instagram"
-
-        # Obtener permalink
-        permalink = ""
-        try:
-            info_url = f"https://graph.facebook.com/v21.0/{media_id}?fields=permalink&access_token={access_token}"
-            with urllib.request.urlopen(info_url, timeout=30) as info_resp:
-                info_data = json.loads(info_resp.read().decode())
-                permalink = info_data.get("permalink", "")
-        except Exception:
-            pass
-
-        logger.info(f"[Instagram] Reel publicado exitosamente: {permalink or media_id}")
-        return True, permalink or media_id, "Publicado exitosamente en Instagram"
-
-    except Exception as e:
-        logger.error(f"[Instagram] Excepción en publish_video_to_instagram: {e}")
-        # Intentar limpiar archivo temporal si falló antes
-        if temp_dbx_path:
+    except Exception as e_gen:
+        logger.error(f"[Meta] Excepción general en publish_video_to_meta: {e_gen}")
+        if not results["instagram"]["error"]:
+            results["instagram"]["error"] = str(e_gen)
+        if not results["facebook"]["error"]:
+            results["facebook"]["error"] = str(e_gen)
+    finally:
+        # Limpieza del archivo temporal en Dropbox
+        if temp_dbx_path and dbx:
             try:
                 dbx.files_delete_v2(temp_dbx_path)
-            except Exception:
-                pass
-        return False, "", str(e)
+                logger.info("[Meta] Video temporal eliminado de Dropbox")
+            except Exception as e_del:
+                logger.warning(f"[Meta] No se pudo eliminar archivo temporal de Dropbox: {e_del}")
 
-async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int = 17) -> bool:
-    """Asegura que el programador de la playlist esté activado (run_status = 1) en VDO Panel."""
+    return results
+
+def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tuple[bool, str, str]:
+    """Retrocompatibilidad: llama a publish_video_to_meta y retorna resultado de Instagram."""
+    meta_res = publish_video_to_meta(local_video_path, caption)
+    ig = meta_res["instagram"]
+    if ig["success"]:
+        return True, ig["permalink"], "Publicado exitosamente en Instagram"
+    return False, "", ig["error"]
+
+async def set_vdo_schedule_status(session: aiohttp.ClientSession, run_status: int = 1, sched_id: int = 17) -> bool:
+    """Configura el estado del programador de la playlist (run_status: 1 = ON, 0 = OFF) en VDO Panel."""
     try:
         sched_url = "https://stream.conexion.com.ve/broadcaster/scheduler"
         async with session.get(sched_url) as resp:
@@ -464,7 +546,7 @@ async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int =
             
         post_data = {
             'sched_id': str(sched_id),
-            'run_status': '1',
+            'run_status': str(run_status),
             '_token': token
         }
         headers = {
@@ -473,13 +555,23 @@ async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int =
             'Origin': 'https://stream.conexion.com.ve'
         }
         async with session.post("https://stream.conexion.com.ve/broadcaster/change-schedule-run-status", data=post_data, headers=headers) as resp:
-            logger.info(f"Activación de scheduler {sched_id} (run_status=1): HTTP {resp.status}")
+            logger.info(f"Configuración de scheduler {sched_id} (run_status={run_status}): HTTP {resp.status}")
             return resp.status == 200
     except Exception as e:
-        logger.error(f"Error activando scheduler run status: {e}")
+        logger.error(f"Error configurando scheduler run status: {e}")
         return False
 
+async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int = 17) -> bool:
+    """Retrocompatibilidad: activa el programador continuo."""
+    return await set_vdo_schedule_status(session, run_status=1, sched_id=sched_id)
+
 async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
+    """
+    Controla coordinadamente el streaming de VDO Panel:
+    - stop: Desactiva schedule (run_status=0), detiene WebTV (stop-webtv) y detiene el servidor RTMP (stop-serv-confirm).
+    - start: Activa schedule (run_status=1), inicia servidor RTMP (start-serv-confirm), inicia WebTV (start-webtv) y verifica playout.
+    - restart: Ejecuta secuencia de stop y luego secuencia de start.
+    """
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
@@ -495,6 +587,10 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
         
     login_url = "https://stream.conexion.com.ve/broadcaster/login"
     ajax_url = "https://stream.conexion.com.ve/broadcaster/ajax-get-current-running"
+    headers_common = {
+        "Referer": "https://stream.conexion.com.ve/broadcaster",
+        "User-Agent": "Mozilla/5.0"
+    }
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -512,17 +608,33 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False, f"❌ Fallo al autenticar en VDO Panel (HTTP {resp.status})."
                     
-            # 2. Manejo según acción
+            # 2. Funciones auxiliares para acciones coordinadas
+            async def do_stop():
+                logger.info("[VDO Control] 1/3 Desactivando estado de programación (run_status = 0)...")
+                await set_vdo_schedule_status(session, run_status=0)
+                logger.info("[VDO Control] 2/3 Deteniendo WebTV scheduler...")
+                async with session.get("https://stream.conexion.com.ve/broadcaster/stop-webtv", headers=headers_common) as r:
+                    logger.info(f"[VDO Control] stop-webtv: HTTP {r.status}")
+                logger.info("[VDO Control] 3/3 Deteniendo servicio RTMP...")
+                async with session.get("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm", headers=headers_common) as r:
+                    logger.info(f"[VDO Control] stop-serv-confirm: HTTP {r.status}")
+
+            async def do_start():
+                logger.info("[VDO Control] 1/3 Activando estado de programación (run_status = 1)...")
+                await set_vdo_schedule_status(session, run_status=1)
+                logger.info("[VDO Control] 2/3 Iniciando servicio RTMP...")
+                async with session.get("https://stream.conexion.com.ve/broadcaster/start-serv-confirm", headers=headers_common) as r:
+                    logger.info(f"[VDO Control] start-serv-confirm: HTTP {r.status}")
+                await asyncio.sleep(2)
+                logger.info("[VDO Control] 3/3 Iniciando WebTV scheduler...")
+                async with session.get("https://stream.conexion.com.ve/broadcaster/start-webtv", headers=headers_common) as r:
+                    logger.info(f"[VDO Control] start-webtv: HTTP {r.status}")
+
+            # 3. Ejecución coordinada
             if action_type == "stop":
-                headers = {
-                    "Referer": "https://stream.conexion.com.ve/broadcaster",
-                    "User-Agent": "Mozilla/5.0"
-                }
-                async with session.get(action_url, headers=headers) as resp:
-                    if resp.status not in [200, 301, 302]:
-                        return False, f"❌ Error del servidor VDO Panel al detener emisión (HTTP {resp.status})."
-                        
-                # Polling para verificar que pasó a Offline
+                await do_stop()
+                
+                # Polling para verificar Offline
                 for _ in range(5):
                     await asyncio.sleep(2)
                     async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
@@ -531,27 +643,21 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                             if isinstance(data, dict):
                                 st = data.get("options", {}).get("status_name", "")
                                 if str(st).lower() == "offline":
-                                    return True, "✅ Stream **DETENIDO** exitosamente.\n\n🔴 **Estado:** `Offline`"
-                return True, "✅ Orden de detención procesada exitosamente en VDO Panel."
-                
-            # Para start o restart:
-            # Primero: Habilitar el programador continuo (run_status = 1)
-            logger.info("Asegurando activación del programador continuo en VDO Panel...")
-            await activate_vdo_scheduler(session)
-            
-            # Segundo: Iniciar/reiniciar el servicio
-            headers = {
-                "Referer": "https://stream.conexion.com.ve/broadcaster",
-                "User-Agent": "Mozilla/5.0"
-            }
-            async with session.get(action_url, headers=headers) as resp:
-                if resp.status not in [200, 301, 302]:
-                    return False, f"❌ Error del servidor VDO Panel al iniciar emisión (HTTP {resp.status})."
-                    
-            # Tercero: Sondeo de verificación de emisión en vivo (hasta 12 segundos)
+                                    return True, "✅ Stream **DETENIDO** exitosamente.\n\n🔴 **Estado:** `Offline`\n📅 **Programador:** `Desactivado (Off)`\n📺 **WebTV:** `Detenido`"
+                return True, "✅ Orden de detención coordinada enviada exitosamente a VDO Panel."
+
+            elif action_type == "restart":
+                await do_stop()
+                await asyncio.sleep(3)
+                await do_start()
+
+            elif action_type == "start":
+                await do_start()
+
+            # 4. Sondeo de verificación de emisión en vivo (hasta 24 segundos, chequeo cada 2s)
             is_live = False
             curr_opts = {}
-            for attempt in range(6):
+            for attempt in range(12):
                 await asyncio.sleep(2)
                 async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as resp:
                     if resp.status == 200:
@@ -569,20 +675,18 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                 pl_name = curr_opts.get("playli_stname", "MUSICALNEW")
                 vid_name = curr_opts.get("video_name", "En cola")
                 return True, (
-                    f"✅ Stream **{act_word}** exitosamente y emitiendo en vivo.\n\n"
+                    f"✅ Stream **{act_word}** coordinadamente y emitiendo en vivo.\n\n"
                     f"🟢 **Estado:** `Live`\n"
+                    f"📅 **Programador:** `Activo (On)`\n"
                     f"📋 **Playlist:** `{pl_name}`\n"
                     f"🎬 **Video actual:** `{vid_name}`"
                 )
             else:
                 curr_status = curr_opts.get("status_name", "Offline") if curr_opts else "Offline"
                 return False, (
-                    f"⚠️ El servicio fue ordenado a iniciar pero VDO Panel reporta estado: `{curr_status}`.\n"
-                    f"Por favor verifica si la lista o el codificador de video tienen algún bloqueo en el panel."
+                    f"⚠️ Se enviaron las órdenes coordinadas de inicio ({act_word}), pero VDO Panel reporta estado: `{curr_status}`.\n"
+                    f"Por favor verifica si la lista o el codificador tienen algún problema en el panel."
                 )
-    except Exception as e:
-        logger.error(f"Excepción en control_vdo_panel: {e}")
-        return False, f"❌ Excepción técnica al comunicar con VDO Panel: {e}"
     except Exception as e:
         logger.error(f"Excepción en control_vdo_panel: {e}")
         return False, f"❌ Excepción técnica al comunicar con VDO Panel: {e}"
@@ -1011,7 +1115,7 @@ async def handle_video(client: Client, message: Message):
             save_deletions(deletions)
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📸 Publicar en Instagram", callback_data=f"ig_pub_{file_id}")],
+                [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
                 [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
                 [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
@@ -1118,8 +1222,8 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     else:
         await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
 
-async def execute_instagram_publish(client: Client, target_message: Message, file_id: str, final_caption: str):
-    """Ejecuta la descarga del video y publicación en Instagram con el caption especificado."""
+async def execute_meta_publish(client: Client, target_message: Message, file_id: str, final_caption: str):
+    """Ejecuta la descarga del video y publicación simultánea en Instagram Reels y Facebook Page."""
     deletions = load_deletions()
     info = deletions.get(file_id, {})
     file_name = info.get("file_name", "video.mp4")
@@ -1133,7 +1237,7 @@ async def execute_instagram_publish(client: Client, target_message: Message, fil
             new_row = []
             for btn in row:
                 if btn.callback_data and (btn.callback_data.startswith("ig_") or btn.callback_data.startswith("noop_ig_")):
-                    new_row.append(InlineKeyboardButton("⏳ Procesando Instagram...", callback_data=f"noop_ig_{file_id}"))
+                    new_row.append(InlineKeyboardButton("⏳ Publicando en Redes (IG+FB)...", callback_data=f"noop_ig_{file_id}"))
                 else:
                     new_row.append(btn)
             processing_rows.append(new_row)
@@ -1145,66 +1249,74 @@ async def execute_instagram_publish(client: Client, target_message: Message, fil
 
     temp_video_path = None
     try:
-        status_msg = await target_message.reply_text("⏳ Descargando video de Telegram para Instagram...")
+        status_msg = await target_message.reply_text("⏳ Descargando video de Telegram para publicar en Redes...")
         
         # Descarga robusta: primero intentar con telegram_file_id directamente
         if tg_file_id:
-            logger.info(f"[Instagram] Descargando media mediante file_id: {tg_file_id}")
+            logger.info(f"[Meta] Descargando media mediante file_id: {tg_file_id}")
             temp_video_path = await client.download_media(tg_file_id)
         elif target_message.video or target_message.document:
-            logger.info("[Instagram] Descargando media desde target_message")
+            logger.info("[Meta] Descargando media desde target_message")
             temp_video_path = await target_message.download()
         else:
             raise Exception("No se encontró el archivo de video en Telegram para descargar.")
 
-        await status_msg.edit_text("⏳ Conectando con Meta y procesando Reel...")
-        success, result, detail = await asyncio.to_thread(publish_video_to_instagram, temp_video_path, final_caption)
+        await status_msg.edit_text("⏳ Conectando con Meta (Instagram Reels + Facebook Page)...")
+        results = await asyncio.to_thread(publish_video_to_meta, temp_video_path, final_caption)
 
-        if success:
-            if result == "dry_run":
-                btn_label = "✅ Validado (Dry Run)"
-                alert_text = (
-                    "🧪 **[Modo Simulación / Dry Run]**\n\n"
-                    "✅ El video fue enviado y procesado exitosamente por Instagram (Meta).\n"
-                    f"📝 **Caption:**\n_{final_caption or 'Sin caption'}_\n\n"
-                    "Como el modo de prueba está activo, **NO** fue publicado en el feed público.\n\n"
-                    "💡 Cuando desees publicar directamente, avísame para desactivar el Dry Run."
-                )
+        ig_res = results.get("instagram", {})
+        fb_res = results.get("facebook", {})
+
+        ig_success = ig_res.get("success", False)
+        fb_success = fb_res.get("success", False)
+
+        alert_parts = ["📲 **RESULTADO DE PUBLICACIÓN EN REDES SOCIALES**\n"]
+
+        if ig_success:
+            if ig_res.get("permalink") == "dry_run":
+                alert_parts.append("📸 **Instagram:** ✅ Validado con éxito (Modo Simulación / Dry Run)")
             else:
-                btn_label = "✅ Publicado en IG"
-                alert_text = (
-                    f"📸 ✅ **¡Reel publicado exitosamente en Instagram!**\n\n"
-                    f"📝 **Caption:**\n_{final_caption or 'Sin caption'}_\n\n"
-                    f"🔗 Enlace: {result}"
-                )
-
-            success_rows = []
-            if current_markup and current_markup.inline_keyboard:
-                for row in current_markup.inline_keyboard:
-                    new_row = []
-                    for btn in row:
-                        if btn.callback_data and (btn.callback_data.startswith("ig_") or btn.callback_data.startswith("noop_ig_")):
-                            new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_ig_{file_id}"))
-                        else:
-                            new_row.append(btn)
-                    success_rows.append(new_row)
-            try:
-                if success_rows:
-                    await target_message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(success_rows))
-            except Exception:
-                pass
-
-            await status_msg.edit_text(alert_text)
+                alert_parts.append(f"📸 **Instagram Reel:** ✅ Publicado\n🔗 {ig_res.get('permalink')}")
         else:
-            try:
-                if current_markup:
-                    await target_message.edit_reply_markup(reply_markup=current_markup)
-            except Exception:
-                pass
-            await status_msg.edit_text(f"❌ **Error al procesar en Instagram:**\n`{detail}`")
+            alert_parts.append(f"📸 **Instagram Reel:** ❌ Error: `{ig_res.get('error', 'Desconocido')}`")
+
+        alert_parts.append("")
+
+        if fb_success:
+            if fb_res.get("permalink") == "dry_run":
+                alert_parts.append("👤 **Facebook:** ✅ Validado con éxito (Modo Simulación / Dry Run)")
+            else:
+                alert_parts.append(f"👤 **Facebook Fanpage:** ✅ Publicado\n🔗 {fb_res.get('permalink')}")
+        else:
+            alert_parts.append(f"👤 **Facebook Fanpage:** ❌ Error: `{fb_res.get('error', 'Desconocido')}`")
+
+        if final_caption:
+            alert_parts.append(f"\n📝 **Caption:**\n_{final_caption}_")
+
+        alert_text = "\n".join(alert_parts)
+
+        # Actualizar botón
+        btn_label = "✅ Publicado en Redes" if (ig_success and fb_success) else ("⚠️ Publicado Parcial" if (ig_success or fb_success) else "❌ Error en Redes")
+        success_rows = []
+        if current_markup and current_markup.inline_keyboard:
+            for row in current_markup.inline_keyboard:
+                new_row = []
+                for btn in row:
+                    if btn.callback_data and (btn.callback_data.startswith("ig_") or btn.callback_data.startswith("noop_ig_")):
+                        new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_ig_{file_id}"))
+                    else:
+                        new_row.append(btn)
+                success_rows.append(new_row)
+        try:
+            if success_rows:
+                await target_message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(success_rows))
+        except Exception:
+            pass
+
+        await status_msg.edit_text(alert_text)
 
     except Exception as e:
-        logger.error(f"Error en publicación de Instagram: {e}")
+        logger.error(f"Error en publicación Meta: {e}")
         try:
             if current_markup:
                 await target_message.edit_reply_markup(reply_markup=current_markup)
@@ -1218,11 +1330,14 @@ async def execute_instagram_publish(client: Client, target_message: Message, fil
             except Exception:
                 pass
 
+async def execute_instagram_publish(client: Client, target_message: Message, file_id: str, final_caption: str):
+    """Retrocompatibilidad."""
+    await execute_meta_publish(client, target_message, file_id, final_caption)
 
 @app.on_callback_query(filters.regex(r"^ig_pub_"))
 async def handle_instagram_publish_callback(client: Client, callback_query: CallbackQuery):
     if not is_admin(callback_query.from_user.id):
-        await callback_query.answer("❌ Solo administradores pueden publicar en Instagram.", show_alert=True)
+        await callback_query.answer("❌ Solo administradores pueden publicar en redes.", show_alert=True)
         return
 
     data = callback_query.data
@@ -1243,14 +1358,17 @@ async def handle_instagram_publish_callback(client: Client, callback_query: Call
     # Presentar opciones de confirmación/edición del caption
     preview_caption = caption if caption else "(Sin texto / Vacío)"
     text = (
-        f"📸 **PUBLICACIÓN EN INSTAGRAM**\n\n"
+        f"📲 **PUBLICACIÓN EN REDES SOCIALES**\n"
+        f"Se publicará simultáneamente en:\n"
+        f"• **Instagram Reels**\n"
+        f"• **Facebook Fanpage** (Plataforma Conexión)\n\n"
         f"📝 **Caption actual:**\n"
         f"_{preview_caption}_\n\n"
         f"¿Deseas publicar con este texto o editarlo?"
     )
 
     confirm_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar y Publicar", callback_data=f"ig_go_{file_id}")],
+        [InlineKeyboardButton("✅ Confirmar y Publicar en Redes", callback_data=f"ig_go_{file_id}")],
         [InlineKeyboardButton("✏️ Editar Caption", callback_data=f"ig_edit_{file_id}")],
         [InlineKeyboardButton("❌ Cancelar", callback_data=f"ig_cancel_{file_id}")]
     ])
@@ -1279,9 +1397,9 @@ async def handle_ig_go_callback(client: Client, callback_query: CallbackQuery):
     state = admin_states.pop(admin_id, {})
     video_msg = state.get("video_message", callback_query.message)
 
-    await callback_query.answer("🚀 Iniciando publicación...", show_alert=False)
+    await callback_query.answer("🚀 Iniciando publicación en redes...", show_alert=False)
     await callback_query.message.delete()
-    await execute_instagram_publish(client, video_msg, file_id, caption)
+    await execute_meta_publish(client, video_msg, file_id, caption)
 
 @app.on_callback_query(filters.regex(r"^ig_edit_"))
 async def handle_ig_edit_callback(client: Client, callback_query: CallbackQuery):
@@ -1301,7 +1419,7 @@ async def handle_ig_edit_callback(client: Client, callback_query: CallbackQuery)
     }
 
     await callback_query.message.edit_text(
-        "✏️ **Escribe en el chat el nuevo caption/texto para Instagram.**\n\n"
+        "✏️ **Escribe en el chat el nuevo caption/texto para las Redes (IG + FB).**\n\n"
         "Puedes incluir hashtags (#) y menciones (@). En cuanto lo envíes, comenzará la publicación."
     )
     await callback_query.answer()
@@ -1317,7 +1435,7 @@ async def handle_ig_cancel_callback(client: Client, callback_query: CallbackQuer
 
 @app.on_callback_query(filters.regex(r"^noop_ig_"))
 async def handle_noop_ig_callback(client: Client, callback_query: CallbackQuery):
-    await callback_query.answer("Este video ya fue procesado para Instagram.", show_alert=True)
+    await callback_query.answer("Este video ya fue procesado para las redes.", show_alert=True)
 
 @app.on_callback_query(filters.regex(r"^noop_"))
 async def handle_noop_callback(client: Client, callback_query: CallbackQuery):
@@ -1399,8 +1517,8 @@ async def handle_admin_text(client: Client, message: Message):
             deletions[file_id]["caption"] = new_caption
             save_deletions(deletions)
 
-        await message.reply_text(f"📝 **Nuevo caption guardado:**\n_{new_caption}_\n\n🚀 Iniciando subida a Instagram...")
-        await execute_instagram_publish(client, video_msg, file_id, new_caption)
+        await message.reply_text(f"📝 **Nuevo caption guardado:**\n_{new_caption}_\n\n🚀 Iniciando subida a Redes (IG + FB)...")
+        await execute_meta_publish(client, video_msg, file_id, new_caption)
         return
 
 
