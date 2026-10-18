@@ -289,6 +289,7 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
     """
     Descarga un video de YouTube en resolución 1080p (o la más alta disponible <= 1080p) con audio multiplexado.
     Usa yt-dlp y ffmpeg para fusionar el mejor stream de video y audio en un contenedor MP4.
+    Incluye evasión de bloqueo antibot de centros de datos (simulación de clientes móviles iOS/Android y soporte de cookies.txt).
     Retorna: (éxito, ruta_archivo_local, título_video, error_msg)
     """
     try:
@@ -307,11 +308,29 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             'quiet': False,
             'no_warnings': False,
             'windowsfilenames': True,
+            # Evasión de antibot de YouTube en VPS (utilizar clientes móviles iOS y Android que no exigen login estricto)
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'android', 'web']
+                }
+            },
             'postprocessors': [{
                 'key': 'FFmpegVideoConvertor',
                 'preferedformat': 'mp4',
             }],
         }
+        
+        # Si existe un archivo cookies.txt en el directorio de la aplicación, cargarlo automáticamente
+        cookies_candidates = [
+            os.path.join(os.getcwd(), "cookies.txt"),
+            "/app/cookies.txt",
+            "cookies.txt"
+        ]
+        for cpath in cookies_candidates:
+            if os.path.exists(cpath):
+                ydl_opts['cookiefile'] = cpath
+                logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
+                break
         
         logger.info(f"[YouTube] Extrayendo y descargando: {url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
