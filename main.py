@@ -285,22 +285,95 @@ def dropbox_delete_file(dropbox_file_path: str) -> bool:
         logger.warning(f"No se pudo eliminar el archivo de audio de Dropbox ({dropbox_file_path}): {e}")
         return False
 
+def download_via_external_api(url: str, output_dir: str = "downloads") -> tuple[bool, str, str, str]:
+    """
+    Descarga videos de YouTube en 1080p usando un endpoint externo de procesamiento.
+    Esto elude 100% los bloqueos de IP y 'Sign in to confirm you are not a bot' de los centros de datos (VPS).
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        encoded_yt_url = urllib.parse.quote(url, safe='')
+        api_url = f"https://loader.to/ajax/download.php?button=1&start=1&end=1&format=1080&url={encoded_yt_url}"
+        
+        req = urllib.request.Request(api_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+            
+        progress_url = data.get("progress_url")
+        video_title = data.get("title") or "video_youtube"
+        
+        if not progress_url:
+            return False, "", video_title, "No se recibió URL de procesamiento del servicio externo."
+            
+        logger.info(f"[YouTube API] Procesando video en 1080p: {video_title} ({progress_url})...")
+        
+        # Sondeo de finalización (hasta 60 segundos)
+        direct_download_url = None
+        for attempt in range(25):
+            time.sleep(2.5)
+            p_req = urllib.request.Request(progress_url, headers={'User-Agent': 'Mozilla/5.0'})
+            try:
+                with urllib.request.urlopen(p_req, timeout=15) as p_resp:
+                    p_data = json.loads(p_resp.read().decode())
+                    if p_data.get("download_url"):
+                        direct_download_url = p_data.get("download_url")
+                        break
+                    elif p_data.get("success") == 1 and p_data.get("progress") == 1000:
+                        direct_download_url = p_data.get("download_url")
+                        break
+            except Exception as e_poll:
+                logger.warning(f"[YouTube API] Polling warning: {e_poll}")
+                
+        if not direct_download_url:
+            return False, "", video_title, "Tiempo de espera agotado generando el enlace de descarga 1080p."
+            
+        logger.info(f"[YouTube API] Enlace 1080p obtenido: {direct_download_url}. Descargando stream...")
+        safe_name = sanitize_filename(f"{video_title}.mp4")
+        if not safe_name.endswith(".mp4"):
+            safe_name += ".mp4"
+            
+        local_dest = os.path.join(output_dir, f"{uuid.uuid4().hex[:6]}_{safe_name}")
+        
+        dl_req = urllib.request.Request(direct_download_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(dl_req, timeout=60) as dl_resp:
+            with open(local_dest, "wb") as f_out:
+                while chunk := dl_resp.read(65536):
+                    f_out.write(chunk)
+                    
+        if os.path.exists(local_dest) and os.path.getsize(local_dest) > 1024:
+            logger.info(f"[YouTube API] Descarga exitosa: {local_dest} ({os.path.getsize(local_dest)} bytes)")
+            return True, local_dest, video_title, ""
+        else:
+            return False, "", video_title, "El archivo descargado está vacío o corrupto."
+            
+    except Exception as e:
+        logger.error(f"[YouTube API] Excepción en servicio externo: {e}")
+        return False, "", "", str(e)
+
 def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[bool, str, str, str]:
     """
-    Descarga un video de YouTube en resolución 1080p (o la más alta disponible <= 1080p) con audio multiplexado.
-    Usa yt-dlp y ffmpeg para fusionar el mejor stream de video y audio en un contenedor MP4.
-    Incluye evasión de bloqueo antibot de centros de datos (simulación de clientes móviles iOS/Android y soporte de cookies.txt).
-    Retorna: (éxito, ruta_archivo_local, título_video, error_msg)
+    Descarga un video de YouTube en resolución 1080p:
+    1. Primero intenta mediante API externa especializada para eludir completamente bloqueos de IP en VPS.
+    2. Si el servicio externo falla o tiene cola, ejecuta yt-dlp con ffmpeg y cookies de respaldo.
     """
+    # 1. Intentar vía API externa
+    logger.info(f"[YouTube] Intentando descarga 1080p mediante bypass API: {url}")
+    api_ok, api_path, api_title, api_err = download_via_external_api(url, output_dir)
+    if api_ok and os.path.exists(api_path):
+        return True, api_path, api_title, ""
+        
+    logger.warning(f"[YouTube] API externa no disponible ({api_err}). Intentando con motor nativo yt-dlp...")
+    
+    # 2. Fallback con yt-dlp
     try:
         import yt_dlp
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Plantilla segura para nombre de archivo
         out_template = os.path.join(output_dir, "%(id)s_%(title).80s.%(ext)s")
         
         ydl_opts = {
-            # Seleccionar el mejor video hasta 1080p + mejor audio, o fallback al mejor combinado <= 1080p
             'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
             'merge_output_format': 'mp4',
             'outtmpl': out_template,
@@ -308,7 +381,6 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             'quiet': False,
             'no_warnings': False,
             'windowsfilenames': True,
-            # Evasión infalible de antibot de YouTube en VPS (web_safari y web_embedded funcionan sin login ni SABR)
             'extractor_args': {
                 'youtube': {
                     'player_client': ['web_safari', 'web_embedded', 'android']
@@ -320,69 +392,40 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             }],
         }
         
-        # Si existe autenticación OAuth2 de YouTube guardada, usarla preferentemente
-        oauth_token_candidates = [
-            os.path.expanduser("~/.config/yt-dlp/youtube-oauth2.json"),
-            os.path.expanduser("~/.config/yt-dlp/youtube-oauth2_token.json"),
-            "/root/.config/yt-dlp/youtube-oauth2.json"
+        cookies_candidates = [
+            os.path.join(os.getcwd(), "cookies.txt"),
+            "/app/cookies.txt",
+            "cookies.txt"
         ]
-        has_oauth = any(os.path.exists(p) for p in oauth_token_candidates)
-        if has_oauth:
-            ydl_opts['username'] = 'oauth2'
-            ydl_opts['password'] = ''
-            logger.info("[YouTube] Utilizando autenticación OAuth2 vinculada.")
-        else:
-            # Si existe un archivo cookies.txt válido en el directorio, cargarlo
-            cookies_candidates = [
-                os.path.join(os.getcwd(), "cookies.txt"),
-                "/app/cookies.txt",
-                "cookies.txt"
-            ]
-            for cpath in cookies_candidates:
-                if os.path.exists(cpath):
-                    ydl_opts['cookiefile'] = cpath
-                    logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
-                    break
-        
-        logger.info(f"[YouTube] Extrayendo y descargando: {url}")
-        info = None
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as e_first:
-            logger.warning(f"[YouTube] Primer intento falló ({e_first}). Reintentando con clientes alternativos...")
-            fallback_opts = dict(ydl_opts)
-            fallback_opts.pop('cookiefile', None)
-            fallback_opts['extractor_args'] = {
-                'youtube': {
-                    'player_client': ['android', 'web_embedded']
-                }
-            }
-            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
-                info = ydl_fb.extract_info(url, download=True)
+        for cpath in cookies_candidates:
+            if os.path.exists(cpath):
+                ydl_opts['cookiefile'] = cpath
+                logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
+                break
                 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
         if not info:
-            return False, "", "", "No se pudo extraer información del video de YouTube."
-                
+            return False, "", "", "No se pudo extraer información del video."
+            
         title = info.get("title", "video_youtube")
         cand_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(info.get('id', ''))]
         if cand_files:
             downloaded_file = cand_files[0]
         else:
-            return False, "", title, "El archivo descargado no se encuentra en el directorio temporal."
+            return False, "", title, "No se encontró el archivo descargado."
             
-        # Si existe versión mp4 convertida
         base, _ = os.path.splitext(downloaded_file)
         final_mp4 = f"{base}.mp4"
         if os.path.exists(final_mp4):
             downloaded_file = final_mp4
             
-        logger.info(f"[YouTube] Descarga 1080p exitosa: {downloaded_file} ({title})")
         return True, downloaded_file, title, ""
-            
+        
     except Exception as e:
-        logger.error(f"[YouTube] Error descargando video: {e}")
-        return False, "", "", str(e)
+        logger.error(f"[YouTube yt-dlp] Error: {e}")
+        return False, "", "", f"Error API: {api_err} | Error yt-dlp: {e}"
 
 def publish_video_to_meta(local_video_path: str, caption: str = "") -> dict:
     """
@@ -1088,70 +1131,6 @@ async def cmd_status_stream(client: Client, message: Message):
         await msg.edit_text(text)
     else:
         await msg.edit_text("❌ No se pudo obtener el estado de VDO Panel. Revisa las credenciales o conexión.")
-
-@app.on_message(filters.incoming & ~filters.me & filters.command("login_youtube") & filters.private)
-async def cmd_login_youtube(client: Client, message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-        
-    status_msg = await message.reply_text("⏳ Conectando con Google / YouTube para generar código de vinculación...")
-    
-    def run_oauth_flow():
-        import yt_dlp
-        # Usar la ruta persistente de yt-dlp config
-        cfg_dir = os.path.expanduser("~/.config/yt-dlp")
-        os.makedirs(cfg_dir, exist_ok=True)
-        
-        device_code_info = {}
-        
-        class OAuthLogger:
-            def debug(self, msg):
-                self._check(msg)
-            def info(self, msg):
-                self._check(msg)
-            def warning(self, msg):
-                self._check(msg)
-            def error(self, msg):
-                self._check(msg)
-            def _check(self, msg):
-                # Detectar URL y código
-                m = re.search(r'(https://www\.google\.com/device)', msg)
-                if m:
-                    device_code_info['url'] = m.group(1)
-                m_code = re.search(r'code\s+([A-Z0-9]{4}-[A-Z0-9]{4})', msg, re.IGNORECASE)
-                if m_code:
-                    device_code_info['code'] = m_code.group(1)
-                    
-        ydl_opts = {
-            'username': 'oauth2',
-            'password': '',
-            'logger': OAuthLogger(),
-            'quiet': False
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Dispara la verificación de autenticación
-                ydl.extract_info('https://www.youtube.com/watch?v=u31qwQUeGuM', download=False)
-            return True, "✅ ¡Cuenta de YouTube vinculada con éxito! Ya puedes enviar enlaces de YouTube."
-        except Exception as e:
-            if device_code_info.get('url') and device_code_info.get('code'):
-                return False, f"AUTH_NEEDED|{device_code_info['url']}|{device_code_info['code']}"
-            return False, str(e)
-            
-    res_ok, res_data = await asyncio.to_thread(run_oauth_flow)
-    if not res_ok and res_data.startswith("AUTH_NEEDED|"):
-        _, auth_url, auth_code = res_data.split("|")
-        text = (
-            f"🔑 **AUTORIZACIÓN DE YOUTUBE REQUERIDA**\n\n"
-            f"Para que el bot descargue videos sin bloqueos en el VPS, autoriza el acceso una sola vez:\n\n"
-            f"1️⃣ Entra a: {auth_url}\n"
-            f"2️⃣ Introduce este código: `{auth_code}`\n"
-            f"3️⃣ Inicia sesión con cualquier cuenta de Google.\n\n"
-            f"⏳ Una vez que lo apruebes en tu navegador, vuelve a enviar `/login_youtube` para confirmar."
-        )
-        await status_msg.edit_text(text)
-    else:
-        await status_msg.edit_text(res_data)
 
 async def edit_message_or_caption(message: Message, new_text: str, reply_markup=None):
     try:
