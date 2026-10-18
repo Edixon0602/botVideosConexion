@@ -308,10 +308,10 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             'quiet': False,
             'no_warnings': False,
             'windowsfilenames': True,
-            # Evasión de antibot de YouTube en VPS (utilizar clientes móviles iOS y Android que no exigen login estricto)
+            # Evasión de antibot de YouTube en VPS (priorizar Android y Mobile Web que no exigen login estricto)
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios', 'android', 'web']
+                    'player_client': ['android', 'mweb', 'ios']
                 }
             },
             'postprocessors': [{

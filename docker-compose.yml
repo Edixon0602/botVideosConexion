@@ -17,3 +17,5 @@ services:
       - ./botVideosConexion/users.json:/app/users.json
       # Persistencia de las tareas de autodestrucción de videos
       - ./botVideosConexion/deletions.json:/app/deletions.json
+      # Cookies opcionales para YouTube / yt-dlp
+      - ./botVideosConexion/cookies.txt:/app/cookies.txt
