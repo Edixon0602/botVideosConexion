@@ -320,17 +320,29 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             }],
         }
         
-        # Si existe un archivo cookies.txt válido en el directorio, cargarlo
-        cookies_candidates = [
-            os.path.join(os.getcwd(), "cookies.txt"),
-            "/app/cookies.txt",
-            "cookies.txt"
+        # Si existe autenticación OAuth2 de YouTube guardada, usarla preferentemente
+        oauth_token_candidates = [
+            os.path.expanduser("~/.config/yt-dlp/youtube-oauth2.json"),
+            os.path.expanduser("~/.config/yt-dlp/youtube-oauth2_token.json"),
+            "/root/.config/yt-dlp/youtube-oauth2.json"
         ]
-        for cpath in cookies_candidates:
-            if os.path.exists(cpath):
-                ydl_opts['cookiefile'] = cpath
-                logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
-                break
+        has_oauth = any(os.path.exists(p) for p in oauth_token_candidates)
+        if has_oauth:
+            ydl_opts['username'] = 'oauth2'
+            ydl_opts['password'] = ''
+            logger.info("[YouTube] Utilizando autenticación OAuth2 vinculada.")
+        else:
+            # Si existe un archivo cookies.txt válido en el directorio, cargarlo
+            cookies_candidates = [
+                os.path.join(os.getcwd(), "cookies.txt"),
+                "/app/cookies.txt",
+                "cookies.txt"
+            ]
+            for cpath in cookies_candidates:
+                if os.path.exists(cpath):
+                    ydl_opts['cookiefile'] = cpath
+                    logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
+                    break
         
         logger.info(f"[YouTube] Extrayendo y descargando: {url}")
         info = None
@@ -338,8 +350,7 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as e_first:
-            logger.warning(f"[YouTube] Primer intento falló ({e_first}). Reintentando sin cookies/con fallback android...")
-            # Si falló con cookies o un cliente específico, reintentar puramente con android/web_embedded sin cookies
+            logger.warning(f"[YouTube] Primer intento falló ({e_first}). Reintentando con clientes alternativos...")
             fallback_opts = dict(ydl_opts)
             fallback_opts.pop('cookiefile', None)
             fallback_opts['extractor_args'] = {
@@ -1077,6 +1088,70 @@ async def cmd_status_stream(client: Client, message: Message):
         await msg.edit_text(text)
     else:
         await msg.edit_text("❌ No se pudo obtener el estado de VDO Panel. Revisa las credenciales o conexión.")
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("login_youtube") & filters.private)
+async def cmd_login_youtube(client: Client, message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+        
+    status_msg = await message.reply_text("⏳ Conectando con Google / YouTube para generar código de vinculación...")
+    
+    def run_oauth_flow():
+        import yt_dlp
+        # Usar la ruta persistente de yt-dlp config
+        cfg_dir = os.path.expanduser("~/.config/yt-dlp")
+        os.makedirs(cfg_dir, exist_ok=True)
+        
+        device_code_info = {}
+        
+        class OAuthLogger:
+            def debug(self, msg):
+                self._check(msg)
+            def info(self, msg):
+                self._check(msg)
+            def warning(self, msg):
+                self._check(msg)
+            def error(self, msg):
+                self._check(msg)
+            def _check(self, msg):
+                # Detectar URL y código
+                m = re.search(r'(https://www\.google\.com/device)', msg)
+                if m:
+                    device_code_info['url'] = m.group(1)
+                m_code = re.search(r'code\s+([A-Z0-9]{4}-[A-Z0-9]{4})', msg, re.IGNORECASE)
+                if m_code:
+                    device_code_info['code'] = m_code.group(1)
+                    
+        ydl_opts = {
+            'username': 'oauth2',
+            'password': '',
+            'logger': OAuthLogger(),
+            'quiet': False
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Dispara la verificación de autenticación
+                ydl.extract_info('https://www.youtube.com/watch?v=u31qwQUeGuM', download=False)
+            return True, "✅ ¡Cuenta de YouTube vinculada con éxito! Ya puedes enviar enlaces de YouTube."
+        except Exception as e:
+            if device_code_info.get('url') and device_code_info.get('code'):
+                return False, f"AUTH_NEEDED|{device_code_info['url']}|{device_code_info['code']}"
+            return False, str(e)
+            
+    res_ok, res_data = await asyncio.to_thread(run_oauth_flow)
+    if not res_ok and res_data.startswith("AUTH_NEEDED|"):
+        _, auth_url, auth_code = res_data.split("|")
+        text = (
+            f"🔑 **AUTORIZACIÓN DE YOUTUBE REQUERIDA**\n\n"
+            f"Para que el bot descargue videos sin bloqueos en el VPS, autoriza el acceso una sola vez:\n\n"
+            f"1️⃣ Entra a: {auth_url}\n"
+            f"2️⃣ Introduce este código: `{auth_code}`\n"
+            f"3️⃣ Inicia sesión con cualquier cuenta de Google.\n\n"
+            f"⏳ Una vez que lo apruebes en tu navegador, vuelve a enviar `/login_youtube` para confirmar."
+        )
+        await status_msg.edit_text(text)
+    else:
+        await status_msg.edit_text(res_data)
 
 async def edit_message_or_caption(message: Message, new_text: str, reply_markup=None):
     try:

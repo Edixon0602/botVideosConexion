@@ -19,3 +19,5 @@ services:
       - ./botVideosConexion/deletions.json:/app/deletions.json
       # Cookies opcionales para YouTube / yt-dlp
       - ./botVideosConexion/cookies.txt:/app/cookies.txt
+      # Persistencia de tokens de YouTube OAuth2
+      - ./botVideosConexion/ytdlp_config:/root/.config/yt-dlp
