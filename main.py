@@ -308,10 +308,10 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             'quiet': False,
             'no_warnings': False,
             'windowsfilenames': True,
-            # Evasión de antibot de YouTube en VPS (priorizar Android y Mobile Web que no exigen login estricto)
+            # Evasión infalible de antibot de YouTube en VPS (web_safari y web_embedded funcionan sin login ni SABR)
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'mweb', 'ios']
+                    'player_client': ['web_safari', 'web_embedded', 'android']
                 }
             },
             'postprocessors': [{
@@ -320,7 +320,7 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             }],
         }
         
-        # Si existe un archivo cookies.txt en el directorio de la aplicación, cargarlo automáticamente
+        # Si existe un archivo cookies.txt válido en el directorio, cargarlo
         cookies_candidates = [
             os.path.join(os.getcwd(), "cookies.txt"),
             "/app/cookies.txt",
@@ -333,30 +333,41 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
                 break
         
         logger.info(f"[YouTube] Extrayendo y descargando: {url}")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                return False, "", "", "No se pudo extraer información del video de YouTube."
+        info = None
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as e_first:
+            logger.warning(f"[YouTube] Primer intento falló ({e_first}). Reintentando sin cookies/con fallback android...")
+            # Si falló con cookies o un cliente específico, reintentar puramente con android/web_embedded sin cookies
+            fallback_opts = dict(ydl_opts)
+            fallback_opts.pop('cookiefile', None)
+            fallback_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['android', 'web_embedded']
+                }
+            }
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
+                info = ydl_fb.extract_info(url, download=True)
                 
-            title = info.get("title", "video_youtube")
-            downloaded_file = ydl.prepare_filename(info)
+        if not info:
+            return False, "", "", "No se pudo extraer información del video de YouTube."
+                
+        title = info.get("title", "video_youtube")
+        cand_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(info.get('id', ''))]
+        if cand_files:
+            downloaded_file = cand_files[0]
+        else:
+            return False, "", title, "El archivo descargado no se encuentra en el directorio temporal."
             
-            # En caso de que el conversor haya generado extensión .mp4
-            base, _ = os.path.splitext(downloaded_file)
-            final_mp4 = f"{base}.mp4"
-            if os.path.exists(final_mp4):
-                downloaded_file = final_mp4
-                
-            if not os.path.exists(downloaded_file):
-                # Buscar en la carpeta si tiene nombre parecido
-                cand_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(info.get('id', ''))]
-                if cand_files:
-                    downloaded_file = cand_files[0]
-                else:
-                    return False, "", title, "El archivo descargado no se encuentra en el directorio temporal."
-                    
-            logger.info(f"[YouTube] Descarga 1080p exitosa: {downloaded_file} ({title})")
-            return True, downloaded_file, title, ""
+        # Si existe versión mp4 convertida
+        base, _ = os.path.splitext(downloaded_file)
+        final_mp4 = f"{base}.mp4"
+        if os.path.exists(final_mp4):
+            downloaded_file = final_mp4
+            
+        logger.info(f"[YouTube] Descarga 1080p exitosa: {downloaded_file} ({title})")
+        return True, downloaded_file, title, ""
             
     except Exception as e:
         logger.error(f"[YouTube] Error descargando video: {e}")
