@@ -5,3 +5,4 @@ flask
 aiohttp
 beautifulsoup4
 dropbox
+yt-dlp

@@ -285,6 +285,64 @@ def dropbox_delete_file(dropbox_file_path: str) -> bool:
         logger.warning(f"No se pudo eliminar el archivo de audio de Dropbox ({dropbox_file_path}): {e}")
         return False
 
+def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[bool, str, str, str]:
+    """
+    Descarga un video de YouTube en resolución 1080p (o la más alta disponible <= 1080p) con audio multiplexado.
+    Usa yt-dlp y ffmpeg para fusionar el mejor stream de video y audio en un contenedor MP4.
+    Retorna: (éxito, ruta_archivo_local, título_video, error_msg)
+    """
+    try:
+        import yt_dlp
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Plantilla segura para nombre de archivo
+        out_template = os.path.join(output_dir, "%(id)s_%(title).80s.%(ext)s")
+        
+        ydl_opts = {
+            # Seleccionar el mejor video hasta 1080p + mejor audio, o fallback al mejor combinado <= 1080p
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+            'merge_output_format': 'mp4',
+            'outtmpl': out_template,
+            'noplaylist': True,
+            'quiet': False,
+            'no_warnings': False,
+            'windowsfilenames': True,
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+        }
+        
+        logger.info(f"[YouTube] Extrayendo y descargando: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return False, "", "", "No se pudo extraer información del video de YouTube."
+                
+            title = info.get("title", "video_youtube")
+            downloaded_file = ydl.prepare_filename(info)
+            
+            # En caso de que el conversor haya generado extensión .mp4
+            base, _ = os.path.splitext(downloaded_file)
+            final_mp4 = f"{base}.mp4"
+            if os.path.exists(final_mp4):
+                downloaded_file = final_mp4
+                
+            if not os.path.exists(downloaded_file):
+                # Buscar en la carpeta si tiene nombre parecido
+                cand_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(info.get('id', ''))]
+                if cand_files:
+                    downloaded_file = cand_files[0]
+                else:
+                    return False, "", title, "El archivo descargado no se encuentra en el directorio temporal."
+                    
+            logger.info(f"[YouTube] Descarga 1080p exitosa: {downloaded_file} ({title})")
+            return True, downloaded_file, title, ""
+            
+    except Exception as e:
+        logger.error(f"[YouTube] Error descargando video: {e}")
+        return False, "", "", str(e)
+
 def publish_video_to_meta(local_video_path: str, caption: str = "") -> dict:
     """
     Sube un video de forma simultánea a Instagram Reels y a la Página de Facebook usando Meta Graph API.
@@ -1259,7 +1317,25 @@ async def execute_meta_publish(client: Client, target_message: Message, file_id:
             logger.info("[Meta] Descargando media desde target_message")
             temp_video_path = await target_message.download()
         else:
-            raise Exception("No se encontró el archivo de video en Telegram para descargar.")
+            # Fallback: descargar desde el FTP si fue un video importado (ej. YouTube)
+            ftp_folder = info.get("ftp_path", "YouTube")
+            logger.info(f"[Meta] Archivo sin medio en Telegram, descargando copia de respaldo desde FTP: {ftp_folder}/{file_name}")
+            def download_from_ftp(folder: str, filename: str) -> str:
+                os.makedirs("temp_ftp", exist_ok=True)
+                local_dest = os.path.join("temp_ftp", filename)
+                ftp = FTP(FTP_HOST)
+                ftp.login(user=FTP_USER, passwd=FTP_PASS)
+                if folder:
+                    ftp.cwd(folder.strip("/"))
+                with open(local_dest, "wb") as f_out:
+                    ftp.retrbinary(f"RETR {filename}", f_out.write)
+                ftp.quit()
+                return local_dest
+            temp_video_path = await asyncio.to_thread(download_from_ftp, ftp_folder, file_name)
+
+        if not temp_video_path or not os.path.exists(temp_video_path):
+            raise Exception("No se pudo obtener el archivo de video (ni desde Telegram ni desde FTP).")
+
 
         await status_msg.edit_text("⏳ Conectando con Meta (Instagram Reels + Facebook Page)...")
         results = await asyncio.to_thread(publish_video_to_meta, temp_video_path, final_caption)
@@ -1555,6 +1631,107 @@ async def handle_admin_text(client: Client, message: Message):
         
         date_str = format_caracas_time(delete_timestamp)
         await message.reply_text(f"✅ **Autodestrucción programada:**\nEl archivo se eliminará el {date_str} (Hora Vzla).")
+        return
+
+    # Detección de enlaces de YouTube
+    yt_regex = r'(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)[\w-]+[^\s]*)'
+    yt_match = re.search(yt_regex, message.text or "")
+    if yt_match:
+        if not is_admin(admin_id):
+            await message.reply_text("❌ Solo los administradores pueden enviar enlaces de YouTube para descargar.")
+            return
+
+        yt_url = yt_match.group(1)
+        status_msg = await message.reply_text(
+            f"🎬 **Enlace de YouTube detectado:**\n`{yt_url}`\n\n"
+            f"⏳ Conectando con YouTube y descargando en **1080p** (con audio fusionado)..."
+        )
+
+        # 1. Descargar en segundo plano
+        success, local_path, video_title, err = await asyncio.to_thread(download_youtube_video, yt_url)
+        if not success or not os.path.exists(local_path):
+            await status_msg.edit_text(f"❌ **Error al descargar video de YouTube:**\n`{err or 'Fallo desconocido'}`")
+            return
+
+        file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        target_folder = "YouTube"
+        folder_display = f"/{target_folder}"
+
+        # Sanitizar nombre final para FTP y VDO Panel
+        base_name = sanitize_filename(f"{video_title}.mp4")
+        if not base_name.endswith(".mp4"):
+            base_name += ".mp4"
+
+        try:
+            await status_msg.edit_text(
+                f"📥 **Descarga completada:** `{base_name}` ({file_size_mb:.2f} MB)\n\n"
+                f"⏳ Subiendo 10 copias al servidor FTP en la carpeta `{folder_display}`..."
+            )
+
+            # 2. Subir 10 copias al FTP en la carpeta YouTube
+            await asyncio.to_thread(upload_to_ftp, local_path, base_name, target_folder)
+
+            # 3. Extraer audio y subir a Dropbox si está configurado
+            dropbox_audio_path = None
+            try:
+                temp_audio = f"{os.path.splitext(local_path)[0]}.mp3"
+                if extract_audio_from_video(local_path, temp_audio):
+                    dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
+                    dbx_ok = await asyncio.to_thread(upload_audio_to_dropbox, temp_audio, dropbox_folder)
+                    if dbx_ok:
+                        folder_clean = "/" + dropbox_folder.strip("/") if dropbox_folder.strip("/") else ""
+                        dropbox_audio_path = f"{folder_clean}/{os.path.basename(temp_audio)}"
+                    if os.path.exists(temp_audio):
+                        os.remove(temp_audio)
+            except Exception as e_dbx:
+                logger.error(f"[YouTube] Error procesando audio para Dropbox: {e_dbx}")
+
+            # 4. Registrar en deletions.json para autodestrucción y acciones interactivas
+            file_id = str(uuid.uuid4())[:8]
+            deletions = load_deletions()
+            deletions[file_id] = {
+                "ftp_path": target_folder,
+                "file_name": base_name,
+                "delete_after": None,
+                "caption": video_title,
+                "telegram_file_id": None,
+                "dropbox_audio_path": dropbox_audio_path
+            }
+            save_deletions(deletions)
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
+                [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
+                [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
+                [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
+                 InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
+                [InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}"),
+                 InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
+            ])
+
+            user_first = message.from_user.first_name or "Admin"
+            confirm_text = (
+                f"✅ **VIDEO DE YOUTUBE DESCARGADO Y SUBIDO**\n\n"
+                f"🎬 **Título:** {video_title}\n"
+                f"📁 **Archivo:** `{base_name}` ({file_size_mb:.2f} MB)\n"
+                f"📂 **Destino FTP:** `{folder_display}` (10 copias)\n"
+                f"👤 **Descargado por:** {user_first} (ID: `{admin_id}`)\n\n"
+                f"¿Deseas agregarlo a la lista musical, publicarlo en redes o programar su eliminación?"
+            )
+
+            await status_msg.edit_text(confirm_text, reply_markup=keyboard)
+
+        except Exception as e_up:
+            logger.error(f"[YouTube] Error subiendo video a FTP: {e_up}")
+            await status_msg.edit_text(f"❌ Error al procesar o subir el video a FTP:\n`{e_up}`")
+
+        finally:
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+        return
 
 
 # ==========================================
