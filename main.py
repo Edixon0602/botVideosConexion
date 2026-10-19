@@ -165,8 +165,8 @@ def sanitize_filename(filename: str) -> str:
     ext = ext.lower() if ext else ".mp4"
     return f"{base}{ext}"
 
-def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str):
-    """Sube un archivo al servidor FTP en la carpeta específica"""
+def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str, copies: int = 10):
+    """Sube un archivo al servidor FTP en la carpeta específica (1 copia o N copias)"""
     remote_filename = sanitize_filename(remote_filename)
     logger.info(f"Conectando a FTP: {FTP_HOST}...")
     ftp = FTP(FTP_HOST)
@@ -191,20 +191,28 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
                 ftp.quit()
                 raise Exception(f"No se pudo crear ni acceder a la carpeta destino: {target_folder}")
     
+    if copies <= 1:
+        logger.info(f"Subiendo archivo único al FTP: {remote_filename}...")
+        with open(local_file_path, 'rb') as file:
+            ftp.storbinary(f'STOR {remote_filename}', file)
+        ftp.quit()
+        logger.info("Subida de archivo único al FTP completada.")
+        return
+
     name, ext = os.path.splitext(remote_filename)
     
-    for i in range(10):
+    for i in range(copies):
         if i == 0:
             current_filename = remote_filename
         else:
             current_filename = f"{name}-{i}{ext}"
             
-        logger.info(f"Subiendo copia {i+1}/10: {current_filename}...")
+        logger.info(f"Subiendo copia {i+1}/{copies}: {current_filename}...")
         with open(local_file_path, 'rb') as file:
             ftp.storbinary(f'STOR {current_filename}', file)
         
     ftp.quit()
-    logger.info("Subida de 10 copias al FTP completada.")
+    logger.info(f"Subida de {copies} copias al FTP completada.")
 
 def extract_audio_from_video(video_path: str, output_audio_path: str) -> bool:
     """Extrae el audio de un video en formato MP3 usando ffmpeg"""
@@ -864,7 +872,7 @@ async def get_vdo_stream_status() -> dict | None:
         logger.error(f"Error consultando estado del stream: {e}")
     return None
 
-async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None) -> tuple[bool, int]:
+async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None, copies: int = 10) -> tuple[bool, int]:
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
@@ -885,10 +893,6 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
     add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
     
     name, ext = os.path.splitext(file_name)
-    file_list = []
-    for i in range(10):
-        curr_name = file_name if i == 0 else f"{name}-{i}{ext}"
-        file_list.append(curr_name)
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -937,12 +941,15 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 logger.error("No se pudo obtener el CSRF token de Filemanager.")
                 return False, 0
                 
-            # Resolver inteligentemente los 10 nombres exactos presentes en el FileManager
+            # Resolver inteligentemente los nombres exactos presentes en el FileManager
             name, ext = os.path.splitext(file_name)
             sanitized_name = sanitize_filename(file_name)
             s_name, s_ext = os.path.splitext(sanitized_name)
             
-            expected_copies = [s_name + s_ext] + [f"{s_name}-{i}{s_ext}" for i in range(1, 10)]
+            if copies <= 1:
+                expected_copies = [s_name + s_ext]
+            else:
+                expected_copies = [s_name + s_ext] + [f"{s_name}-{i}{s_ext}" for i in range(1, copies)]
             resolved_files = []
             
             for i, exp in enumerate(expected_copies):
@@ -993,7 +1000,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             step2_token = fm_token
             step2_files = []
             
-            logger.info(f"Enviando lote de 10 copias a {batch_url} (Archivos: {resolved_files})...")
+            logger.info(f"Enviando {len(resolved_files)} archivo(s) a {batch_url} (Archivos: {resolved_files})...")
             async with session.post(batch_url, data=batch_post_data, headers=headers_step1) as resp:
                 if resp.status in [200, 302]:
                     batch_html = await resp.text()
@@ -1027,7 +1034,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             async with session.post(add_url, data=post_add_data, headers=headers_step2, allow_redirects=False) as resp:
                 logger.info(f"Respuesta final addtoplaylistpost: HTTP {resp.status}")
                 if resp.status in [200, 302]:
-                    logger.info(f"Lote de {len(step2_files)} copias agregado exitosamente a la playlist {playlist_id}.")
+                    logger.info(f"{len(step2_files)} archivo(s) agregado(s) exitosamente a la playlist {playlist_id}.")
                     return True, len(step2_files)
                 else:
                     logger.error(f"Fallo al confirmar playlist en VDO Panel: HTTP {resp.status}")
@@ -1333,14 +1340,20 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     if not target_folder:
         target_folder = FTP_UPLOAD_PATH or "avances-informativos"
     
-    await callback_query.answer("⏳ Agregando las 10 copias a la Lista Musical...", show_alert=False)
+    copies = info.get("copies", 1 if str(target_folder).strip("/").lower() == "youtube" else 10)
     
-    success, count = await add_files_to_vdo_playlist(target_folder, file_name)
+    if copies == 1:
+        await callback_query.answer("⏳ Agregando video a la Lista Musical...", show_alert=False)
+    else:
+        await callback_query.answer("⏳ Agregando las 10 copias a la Lista Musical...", show_alert=False)
+    
+    success, count = await add_files_to_vdo_playlist(target_folder, file_name, copies=copies)
     
     if success:
         deletions[file_id]["playlist_added"] = True
         save_deletions(deletions)
         
+        btn_label = "✅ Agregado a la Lista" if copies == 1 else f"✅ Agregado ({count}/10)"
         current_markup = callback_query.message.reply_markup
         new_rows = []
         if current_markup and current_markup.inline_keyboard:
@@ -1348,21 +1361,24 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
                 new_row = []
                 for btn in row:
                     if btn.callback_data and btn.callback_data.startswith("addpl_"):
-                        new_row.append(InlineKeyboardButton(f"✅ Agregado ({count}/10)", callback_data=f"noop_{file_id}"))
+                        new_row.append(InlineKeyboardButton(btn_label, callback_data=f"noop_{file_id}"))
                     else:
                         new_row.append(btn)
                 new_rows.append(new_row)
         else:
-            new_rows = [[InlineKeyboardButton(f"✅ Agregado ({count}/10)", callback_data=f"noop_{file_id}")]]
+            new_rows = [[InlineKeyboardButton(btn_label, callback_data=f"noop_{file_id}")]]
             
         try:
             await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
         except Exception:
             pass
             
-        await callback_query.message.reply_text(f"🎵 ✅ **{count}/10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
+        if copies == 1:
+            await callback_query.message.reply_text(f"🎵 ✅ **`{file_name}` agregado con éxito a la Lista Musical (VDO Panel)**.")
+        else:
+            await callback_query.message.reply_text(f"🎵 ✅ **{count}/10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
     else:
-        await callback_query.message.reply_text(f"❌ **Error:** No se pudieron agregar las copias de `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
+        await callback_query.message.reply_text(f"❌ **Error:** No se pudo agregar `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
 
 async def execute_meta_publish(client: Client, target_message: Message, file_id: str, final_caption: str):
     """Ejecuta la descarga del video y publicación simultánea en Instagram Reels y Facebook Page."""
@@ -1749,28 +1765,13 @@ async def handle_admin_text(client: Client, message: Message):
         try:
             await status_msg.edit_text(
                 f"📥 **Descarga completada:** `{base_name}` ({file_size_mb:.2f} MB)\n\n"
-                f"⏳ Subiendo 10 copias al servidor FTP en la carpeta `{folder_display}`..."
+                f"⏳ Subiendo video al servidor FTP en la carpeta `{folder_display}`..."
             )
 
-            # 2. Subir 10 copias al FTP en la carpeta YouTube
-            await asyncio.to_thread(upload_to_ftp, local_path, base_name, target_folder)
+            # 2. Subir 1 sola copia al FTP en la carpeta YouTube
+            await asyncio.to_thread(upload_to_ftp, local_path, base_name, target_folder, 1)
 
-            # 3. Extraer audio y subir a Dropbox si está configurado
-            dropbox_audio_path = None
-            try:
-                temp_audio = f"{os.path.splitext(local_path)[0]}.mp3"
-                if extract_audio_from_video(local_path, temp_audio):
-                    dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
-                    dbx_ok = await asyncio.to_thread(upload_audio_to_dropbox, temp_audio, dropbox_folder)
-                    if dbx_ok:
-                        folder_clean = "/" + dropbox_folder.strip("/") if dropbox_folder.strip("/") else ""
-                        dropbox_audio_path = f"{folder_clean}/{os.path.basename(temp_audio)}"
-                    if os.path.exists(temp_audio):
-                        os.remove(temp_audio)
-            except Exception as e_dbx:
-                logger.error(f"[YouTube] Error procesando audio para Dropbox: {e_dbx}")
-
-            # 4. Registrar en deletions.json para autodestrucción y acciones interactivas
+            # 3. Registrar en deletions.json para autodestrucción y acciones interactivas (sin Dropbox, 1 copia)
             file_id = str(uuid.uuid4())[:8]
             deletions = load_deletions()
             deletions[file_id] = {
@@ -1779,7 +1780,8 @@ async def handle_admin_text(client: Client, message: Message):
                 "delete_after": None,
                 "caption": video_title,
                 "telegram_file_id": None,
-                "dropbox_audio_path": dropbox_audio_path
+                "dropbox_audio_path": None,
+                "copies": 1
             }
             save_deletions(deletions)
 
@@ -1798,7 +1800,7 @@ async def handle_admin_text(client: Client, message: Message):
                 f"✅ **VIDEO DE YOUTUBE DESCARGADO Y SUBIDO**\n\n"
                 f"🎬 **Título:** {video_title}\n"
                 f"📁 **Archivo:** `{base_name}` ({file_size_mb:.2f} MB)\n"
-                f"📂 **Destino FTP:** `{folder_display}` (10 copias)\n"
+                f"📂 **Destino FTP:** `{folder_display}`\n"
                 f"👤 **Descargado por:** {user_first} (ID: `{admin_id}`)\n\n"
                 f"¿Deseas agregarlo a la lista musical, publicarlo en redes o programar su eliminación?"
             )
@@ -2047,15 +2049,17 @@ def auto_delete_worker():
                     logger.info(f"Eliminando archivo caducado: {file_name} de {ftp_path}")
                     success = ftp_delete_file(ftp_path, file_name)
                     
-                    # Eliminar también el audio correspondiente en Dropbox
-                    dbx_audio_path = info.get("dropbox_audio_path")
-                    if not dbx_audio_path:
-                        # Fallback: deducir ruta si no estaba explícita
-                        dbx_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA").strip("/")
-                        base_f, _ = os.path.splitext(file_name)
-                        dbx_audio_path = f"/{dbx_folder}/{base_f}.mp3"
-                    
-                    dbx_deleted = dropbox_delete_file(dbx_audio_path)
+                    # Eliminar también el audio correspondiente en Dropbox (si no es YouTube)
+                    dbx_deleted = False
+                    if str(ftp_path).strip("/").lower() != "youtube":
+                        dbx_audio_path = info.get("dropbox_audio_path")
+                        if not dbx_audio_path:
+                            # Fallback: deducir ruta si no estaba explícita
+                            dbx_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA").strip("/")
+                            base_f, _ = os.path.splitext(file_name)
+                            dbx_audio_path = f"/{dbx_folder}/{base_f}.mp3"
+                        
+                        dbx_deleted = dropbox_delete_file(dbx_audio_path)
                     
                     if success or dbx_deleted:
                         for admin_chat_id in ADMIN_CHAT_IDS:
