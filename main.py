@@ -3254,7 +3254,9 @@ async def handle_admin_text(client: Client, message: Message):
         yt_url = yt_match.group(1)
         status_msg = await message.reply_text(
             f"🎬 **Enlace de YouTube detectado:**\n`{yt_url}`\n\n"
-            f"⏳ Conectando con YouTube y descargando en **hasta 1080p** (con audio fusionado)..."
+            f"⏳ Conectando con YouTube y descargando en **hasta 1080p** "
+            f"(con audio fusionado).\n"
+            f"Esto puede tardar unos minutos..."
         )
 
         # 1. Descargar en segundo plano

@@ -76,6 +76,48 @@ También puedes usar un proxy SOCKS5:
 YOUTUBE_PROXY=socks5://usuario:clave@host:puerto
 ```
 
+### Opción gratuita: Tor en el VPS
+
+Si no quieres pagar un proxy residencial, se puede usar **Tor** en el host del
+VPS. Es gratis, pero más lento y algunos nodos de salida pueden estar bloqueados
+por YouTube. En este servidor ya quedó configurado.
+
+Instalación en Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tor
+```
+
+Agregar a `/etc/tor/torrc`:
+
+```text
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 172.18.0.0/16
+SocksPolicy accept 127.0.0.1
+SocksPolicy reject *
+```
+
+```bash
+sudo systemctl restart tor
+sudo systemctl enable tor
+```
+
+En el `.env` del bot:
+
+```env
+YOUTUBE_PROXY=socks5h://172.18.0.1:9050
+```
+
+`172.18.0.1` es el gateway de la red Docker `nevox_web`; el contenedor lo
+alcanza. Si tu red Docker usa otro gateway, ajústalo. La política de Tor solo
+acepta la red Docker y localhost, no Internet.
+
+Ventajas: gratis y no depende de tu PC.
+Desventajas: la velocidad es baja (cientos de KB/s) y algunos nodos de salida
+pueden estar bloqueados. Si falla un nodo, reintenta la descarga o reinicia Tor
+para cambiar de circuito.
+
 ### 4. Variables opcionales
 
 ```env
