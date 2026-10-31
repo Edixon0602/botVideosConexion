@@ -491,6 +491,7 @@ def youtube_channel_info(access_token=None):
     return {
         "channel_id": channel.get("id", ""),
         "channel_title": snippet.get("title", ""),
+        "channel_custom_url": snippet.get("customUrl", ""),
         "channel_thumbnail": (snippet.get("thumbnails", {}).get("default", {}) or {}).get(
             "url", ""
         ),

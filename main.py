@@ -2611,6 +2611,16 @@ async def _poll_youtube_connection(client: Client, chat_id: int, flow: dict, flo
                 f"{_safe_html(str(result['channel_error'])[:500])}\n"
                 "Revisa que YouTube Data API v3 esté habilitada en Google Cloud."
             )
+        expected_handle = os.getenv("YOUTUBE_CHANNEL_HANDLE", "").strip().lstrip("@").lower()
+        connected_handle = (
+            (channel.get("channel_custom_url") or "").strip().lstrip("@").lower()
+        )
+        if expected_handle and connected_handle and expected_handle != connected_handle:
+            extra += (
+                f"\n\n⚠️ Se conectó el canal @{_safe_html(connected_handle)}, "
+                f"pero se esperaba @{_safe_html(expected_handle)}. "
+                "Si es incorrecto, vuelve a ejecutar /conectar_youtube."
+            )
         await client.send_message(
             chat_id,
             "✅ <b>YouTube conectado</b>\n\n"
