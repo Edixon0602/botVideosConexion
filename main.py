@@ -2616,11 +2616,25 @@ async def _poll_youtube_connection(client: Client, chat_id: int, flow: dict, flo
             (channel.get("channel_custom_url") or "").strip().lstrip("@").lower()
         )
         if expected_handle and connected_handle and expected_handle != connected_handle:
-            extra += (
-                f"\n\n⚠️ Se conectó el canal @{_safe_html(connected_handle)}, "
-                f"pero se esperaba @{_safe_html(expected_handle)}. "
-                "Si es incorrecto, vuelve a ejecutar /conectar_youtube."
+            # No dejamos guardado un token de un canal equivocado: si el cliente
+            # eligió su cuenta personal, no debe poder publicar ahí por error.
+            social_media.disconnect("youtube")
+            logger.warning(
+                "YouTube conectado al canal equivocado: @%s (esperado @%s)",
+                connected_handle,
+                expected_handle,
             )
+            await client.send_message(
+                chat_id,
+                "❌ <b>No se guardó la conexión de YouTube</b>\n\n"
+                f"Se autorizó el canal <b>{_safe_html(name)}</b> "
+                f"(@{_safe_html(connected_handle)}), pero se esperaba "
+                f"<b>@{_safe_html(expected_handle)}</b>.\n\n"
+                "Vuelve a ejecutar /conectar_youtube y elige el canal correcto. "
+                "No se publicará nada en el canal equivocado.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
         await client.send_message(
             chat_id,
             "✅ <b>YouTube conectado</b>\n\n"
@@ -2751,6 +2765,11 @@ async def cmd_connect_youtube(client: Client, message: Message):
         account_lines += f"📺 Canal: {_safe_html(expected_channel)}\n"
     if expected_email:
         account_lines += f"📧 Cuenta: {_safe_html(expected_email)}\n"
+    channel_hint = (
+        f"   ⚠️ Elige {_safe_html(expected_channel)}, no el canal personal.\n"
+        if expected_channel
+        else ""
+    )
     text = (
         "📺 <b>CONECTAR YOUTUBE</b>\n\n"
         + (account_lines + "\n" if account_lines else "")
@@ -2759,7 +2778,8 @@ async def cmd_connect_youtube(client: Client, message: Message):
         f"2️⃣ Escribe este código: <code>{_safe_html(code)}</code>\n"
         "3️⃣ Inicia sesión con la cuenta dueña del canal y acepta el permiso.\n"
         "   Si el canal es una cuenta Brand, selecciónalo cuando Google lo pida.\n"
-        "   Si Google muestra un aviso de app no verificada, entra en "
+        + channel_hint
+        + "   Si Google muestra un aviso de app no verificada, entra en "
         "«Configuración avanzada» y continúa.\n\n"
         f"⏳ El código vence en {expires_min} minutos.\n"
         "Cuando el cliente termine, te aviso por aquí."
