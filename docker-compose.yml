@@ -12,8 +12,14 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=America/Caracas
+      # Los tokens de YouTube/TikTok se guardan fuera del código
+      - SOCIAL_TOKENS_FILE=/app/data/social_tokens.json
     volumes:
       # Persistencia de los usuarios autorizados
       - ./botVideosConexion/users.json:/app/users.json
       # Persistencia de las tareas de autodestrucción de videos
       - ./botVideosConexion/deletions.json:/app/deletions.json
+      # Persistencia de tokens de YouTube/TikTok
+      - ./botVideosConexion/data:/app/data
+      # Cookies de YouTube: se pueden actualizar sin reconstruir la imagen
+      - ./botVideosConexion/cookies.txt:/app/cookies.txt:ro

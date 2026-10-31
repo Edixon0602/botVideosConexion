@@ -14,3 +14,7 @@ downloads/
 *.mp4
 *.mkv
 *.avi
+social_tokens.json
+social_tokens.json.tmp.*
+data/
+cookies.txt

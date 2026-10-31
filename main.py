@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import json
 import logging
@@ -9,6 +10,8 @@ import urllib.request
 import urllib.parse
 import time
 import re
+import html
+import tempfile
 import unicodedata
 import aiohttp
 from bs4 import BeautifulSoup
@@ -36,7 +39,7 @@ def format_caracas_time(ts):
     dt = datetime.datetime.fromtimestamp(ts, tz=CARACAS_TZ)
     return dt.strftime('%Y-%m-%d %I:%M:%S %p')
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, flash, Response, session
+from flask import Flask, render_template, request, redirect, url_for, flash, session
 
 # Configurar logging
 logging.basicConfig(
@@ -47,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 # Cargar variables de entorno
 load_dotenv()
+
+import social_media
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_ID = os.getenv("API_ID")
@@ -123,6 +128,9 @@ def save_users(users):
 DELETIONS_FILE = 'deletions.json'
 deletions_lock = threading.Lock()
 admin_states = {}
+youtube_connect_state = {"active": False, "started_at": 0, "flow_id": 0, "task": None}
+tiktok_connect_state = {"active": False, "started_at": 0, "flow_id": 0, "task": None}
+social_publish_in_progress = set()
 
 def load_deletions():
     with deletions_lock:
@@ -361,79 +369,258 @@ def download_via_external_api(url: str, output_dir: str = "downloads") -> tuple[
         logger.error(f"[YouTube API] Excepción en servicio externo: {e}")
         return False, "", "", str(e)
 
+def _youtube_cookies_file():
+    candidates = []
+    explicit = os.getenv("YOUTUBE_COOKIES_FILE")
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([
+        os.path.join(os.getcwd(), "cookies.txt"),
+        "/app/cookies.txt",
+        "cookies.txt",
+    ])
+    seen = set()
+    for path in candidates:
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        if os.path.isfile(abs_path):
+            return abs_path
+    return None
+
+
+def _youtube_deno_path():
+    explicit = os.getenv("YOUTUBE_DENO_PATH")
+    if explicit and os.path.exists(explicit):
+        return explicit
+    return shutil.which("deno")
+
+
+def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None):
+    out_template = os.path.join(
+        output_dir, f"{run_id}_%(id)s_%(title).80s.%(ext)s"
+    )
+    opts = {
+        # Preferir H.264 (avc1) para que el video sea compatible con el VDO
+        # Panel y con TikTok. Si no hay, se acepta cualquier códec dentro de mp4.
+        "format": (
+            "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1080]+bestaudio/"
+            "best[height<=1080]/best"
+        ),
+        "merge_output_format": "mp4",
+        "outtmpl": out_template,
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": False,
+        "windowsfilenames": True,
+        "prefer_ffmpeg": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_safari", "web_embedded", "android_vr"],
+            }
+        },
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
+    }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+    deno_path = _youtube_deno_path()
+    if deno_path:
+        opts["js_runtimes"] = {"deno": {"path": deno_path}}
+    proxy = os.getenv("YOUTUBE_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+    try:
+        __import__("yt_dlp_ejs")
+    except Exception:
+        # Si el paquete yt-dlp-ejs no está instalado, permitir que yt-dlp
+        # descargue los scripts EJS desde GitHub.
+        opts["remote_components"] = {"ejs:github"}
+    return opts
+
+
+def _youtube_attempt(url: str, output_dir: str, run_id: str,
+                     cookie_file: str = None):
+    import yt_dlp
+    # Se usa una copia temporal para que yt-dlp no reescriba cookies.txt.
+    cookie_copy = None
+    if cookie_file:
+        fd, cookie_copy = tempfile.mkstemp(
+            prefix="yt_cookies_", suffix=".txt"
+        )
+        os.close(fd)
+        try:
+            shutil.copyfile(cookie_file, cookie_copy)
+            try:
+                os.chmod(cookie_copy, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                os.remove(cookie_copy)
+            except Exception:
+                pass
+            raise
+    try:
+        opts = _youtube_ydl_opts(output_dir, run_id, cookie_copy)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    finally:
+        if cookie_copy:
+            try:
+                os.remove(cookie_copy)
+            except Exception:
+                pass
+    if not info:
+        raise Exception("No se pudo extraer información del video.")
+
+    title = info.get("title", "video_youtube")
+    candidates = []
+    for item in info.get("requested_downloads") or []:
+        path = item.get("filepath")
+        if path:
+            candidates.append(path)
+    for key in ("filepath", "_filename"):
+        path = info.get(key)
+        if path:
+            candidates.append(path)
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path, title
+
+    # Buscar por el prefijo único de esta ejecución, evitando archivos
+    # temporales y prefiriendo el MP4 final.
+    matches = []
+    for name in os.listdir(output_dir):
+        if not name.startswith(run_id):
+            continue
+        if ".part" in name or name.endswith((".ytdl", ".temp")):
+            continue
+        if re.search(r"\.f\d+\.", name):
+            continue
+        matches.append(os.path.join(output_dir, name))
+    if matches:
+        matches.sort(
+            key=lambda p: (p.lower().endswith(".mp4"), os.path.getmtime(p)),
+            reverse=True,
+        )
+        return matches[0], title
+    raise Exception("No se encontró el archivo descargado.")
+
+
 def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[bool, str, str, str]:
     """
-    Descarga un video de YouTube en resolución 1080p:
-    1. Primero intenta mediante API externa especializada para eludir completamente bloqueos de IP en VPS.
-    2. Si el servicio externo falla o tiene cola, ejecuta yt-dlp con ffmpeg y cookies de respaldo.
+    Descarga un video de YouTube en 1080p:
+    1. yt-dlp con cookies (si existen), Deno/EJS y clientes actuales.
+    2. yt-dlp sin cookies, por si las cookies están vencidas.
+    3. API externa solo si YOUTUBE_EXTERNAL_API_ENABLED=True.
     """
-    # 1. Intentar vía API externa
-    logger.info(f"[YouTube] Intentando descarga 1080p mediante bypass API: {url}")
-    api_ok, api_path, api_title, api_err = download_via_external_api(url, output_dir)
-    if api_ok and os.path.exists(api_path):
-        return True, api_path, api_title, ""
-        
-    logger.warning(f"[YouTube] API externa no disponible ({api_err}). Intentando con motor nativo yt-dlp...")
-    
-    # 2. Fallback con yt-dlp
-    try:
-        import yt_dlp
-        os.makedirs(output_dir, exist_ok=True)
-        out_template = os.path.join(output_dir, "%(id)s_%(title).80s.%(ext)s")
-        
-        ydl_opts = {
-            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
-            'merge_output_format': 'mp4',
-            'outtmpl': out_template,
-            'noplaylist': True,
-            'quiet': False,
-            'no_warnings': False,
-            'windowsfilenames': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web_safari', 'web_embedded', 'android']
-                }
-            },
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        }
-        
-        cookies_candidates = [
-            os.path.join(os.getcwd(), "cookies.txt"),
-            "/app/cookies.txt",
-            "cookies.txt"
-        ]
-        for cpath in cookies_candidates:
-            if os.path.exists(cpath):
-                ydl_opts['cookiefile'] = cpath
-                logger.info(f"[YouTube] Utilizando archivo de cookies: {cpath}")
-                break
-                
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-        if not info:
-            return False, "", "", "No se pudo extraer información del video."
-            
-        title = info.get("title", "video_youtube")
-        cand_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(info.get('id', ''))]
-        if cand_files:
-            downloaded_file = cand_files[0]
-        else:
-            return False, "", title, "No se encontró el archivo descargado."
-            
-        base, _ = os.path.splitext(downloaded_file)
-        final_mp4 = f"{base}.mp4"
-        if os.path.exists(final_mp4):
-            downloaded_file = final_mp4
-            
-        return True, downloaded_file, title, ""
-        
-    except Exception as e:
-        logger.error(f"[YouTube yt-dlp] Error: {e}")
-        return False, "", "", f"Error API: {api_err} | Error yt-dlp: {e}"
+    os.makedirs(output_dir, exist_ok=True)
+    errors = []
+
+    cookie_file = _youtube_cookies_file()
+    deno_path = _youtube_deno_path()
+    if deno_path:
+        logger.info(f"[YouTube] Deno disponible: {deno_path}")
+    else:
+        logger.warning(
+            "[YouTube] Deno no está instalado. yt-dlp puede fallar al resolver "
+            "los desafíos de YouTube o descargar en baja calidad."
+        )
+
+    attempts = []
+    if cookie_file:
+        attempts.append(("con cookies", cookie_file))
+    attempts.append(("sin cookies", None))
+
+    for label, cookiefile in attempts:
+        run_id = f"yt_{uuid.uuid4().hex[:10]}"
+        try:
+            logger.info(f"[YouTube] Intentando descarga {label}: {url}")
+            path, title = _youtube_attempt(
+                url, output_dir, run_id, cookiefile
+            )
+            if path and os.path.exists(path):
+                logger.info(f"[YouTube] Descarga exitosa ({label}): {path}")
+                return True, path, title, ""
+            errors.append(f"{label}: no se encontró el archivo")
+        except Exception as e:
+            logger.error(f"[YouTube yt-dlp] Error ({label}): {e}")
+            errors.append(f"{label}: {e}")
+
+    if os.getenv("YOUTUBE_EXTERNAL_API_ENABLED", "False").lower() in (
+        "1", "true", "yes", "si", "sí", "on"
+    ):
+        logger.info(f"[YouTube] Intentando API externa de respaldo: {url}")
+        api_ok, api_path, api_title, api_err = download_via_external_api(
+            url, output_dir
+        )
+        if api_ok and os.path.exists(api_path):
+            return True, api_path, api_title, ""
+        errors.append(f"API externa: {api_err}")
+
+    detail = " | ".join(errors) or "No se pudo descargar el video."
+    lowered = detail.lower()
+    if (
+        "this video is unavailable" in lowered
+        or "video unavailable" in lowered
+        or "private video" in lowered
+        or "age-restricted" in lowered
+        or "age restricted" in lowered
+        or "not available in your country" in lowered
+        or "blocked it in your country" in lowered
+    ):
+        friendly = (
+            "El video no está disponible: puede ser privado, eliminado, tener "
+            "restricción de edad o estar bloqueado en la región del servidor. "
+            f"Detalle: {detail}"
+        )
+    elif (
+        "sign in to confirm" in lowered
+        or "confirm you're not a bot" in lowered
+        or "confirm you are not a bot" in lowered
+        or "cookies are no longer valid" in lowered
+        or "login required" in lowered
+    ):
+        friendly = (
+            "YouTube bloqueó la descarga desde el servidor. "
+            "Actualiza cookies.txt con cookies frescas de YouTube o configura "
+            "YOUTUBE_PROXY con un proxy residencial. "
+            f"Detalle: {detail}"
+        )
+    elif (
+        "javascript runtime" in lowered
+        or "ejs" in lowered
+        or "deno" in lowered
+        or "signature solving failed" in lowered
+        or "challenge solving failed" in lowered
+    ):
+        friendly = (
+            "Falta Deno/EJS para que yt-dlp resuelva los desafíos de YouTube. "
+            "Reconstruye la imagen Docker o instala Deno en el servidor. "
+            f"Detalle: {detail}"
+        )
+    elif "requested format is not available" in lowered:
+        friendly = (
+            "YouTube no ofreció un formato compatible para ese video. "
+            "Actualiza yt-dlp/Deno o prueba con otro video. "
+            f"Detalle: {detail}"
+        )
+    else:
+        friendly = detail
+    return False, "", "", friendly
 
 def publish_video_to_meta(local_video_path: str, caption: str = "") -> dict:
     """
@@ -1050,6 +1237,14 @@ async def start(client: Client, message: Message):
     user_id = str(message.from_user.id)
     allowed_users = load_users()
     if user_id in allowed_users or is_admin(user_id):
+        admin_extra = ""
+        if is_admin(user_id):
+            admin_extra = (
+                "\n\n🔗 **Redes Sociales (solo admin):**\n"
+                "📺 `/conectar_youtube` - Vincular el canal de YouTube\n"
+                "🎵 `/conectar_tiktok` - Vincular la cuenta de TikTok\n"
+                "📡 `/redes` - Ver el estado de las cuentas"
+            )
         await message.reply_text(
             "👋 ¡Hola! Envíame un video y lo subiré automáticamente a tu carpeta en el dashboard.\n\n"
             "📺 **Comandos de Transmisión (VDO Panel):**\n"
@@ -1057,6 +1252,7 @@ async def start(client: Client, message: Message):
             "⏹️ `/detener` - Detener streaming\n"
             "🔄 `/reiniciar` - Reiniciar streaming\n"
             "📡 `/estado` - Consultar estado actual del streaming"
+            + admin_extra
         )
     else:
         await message.reply_text(
@@ -1149,6 +1345,681 @@ async def edit_message_or_caption(message: Message, new_text: str, reply_markup=
         pass
     except Exception as e:
         logger.error(f"Error editando mensaje/caption: {e}")
+
+
+# ==========================================
+# HELPERS DE PUBLICACIÓN EN YOUTUBE / TIKTOK
+# ==========================================
+
+def _safe_html(value) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _youtube_title_preview(caption: str, file_name: str = "Video") -> str:
+    text = (caption or "").strip()
+    title = text.splitlines()[0] if text else os.path.splitext(file_name or "Video")[0]
+    title = title.replace("<", " ").replace(">", " ").strip() or "Video"
+    return title[:100]
+
+
+def _social_caption(info: dict, platform: str) -> str:
+    caption = (info.get(f"{platform}_caption") or info.get("caption") or "").strip()
+    if not caption:
+        caption = os.path.splitext(info.get("file_name", "video"))[0]
+    return caption
+
+
+def _youtube_privacy(info: dict) -> str:
+    value = str(
+        info.get("youtube_privacy")
+        or os.getenv("YOUTUBE_PRIVACY_STATUS", "public")
+    ).strip().lower()
+    return value if value in ("public", "unlisted", "private") else "public"
+
+
+def _youtube_privacy_label(value: str) -> str:
+    return {
+        "public": "🌍 Público",
+        "unlisted": "🔗 No listado",
+        "private": "🔒 Privado",
+    }.get(value, value)
+
+
+def _tiktok_privacy(info: dict) -> str:
+    value = str(
+        info.get("tiktok_privacy")
+        or os.getenv("TIKTOK_PRIVACY_LEVEL", "SELF_ONLY")
+    ).strip()
+    return value or "SELF_ONLY"
+
+
+def _tiktok_privacy_label(value: str) -> str:
+    return social_media.TIKTOK_PRIVACY_LABELS.get(value, value)
+
+
+def _replace_callback_button(markup, prefixes, new_label, new_callback):
+    """Reemplaza el botón que empieza con alguno de los prefijos."""
+    if not markup or not getattr(markup, "inline_keyboard", None):
+        return None
+    rows = []
+    changed = False
+    for row in markup.inline_keyboard:
+        new_row = []
+        for btn in row:
+            if btn.callback_data and any(
+                btn.callback_data.startswith(prefix) for prefix in prefixes
+            ):
+                new_row.append(
+                    InlineKeyboardButton(new_label, callback_data=new_callback)
+                )
+                changed = True
+            else:
+                new_row.append(btn)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(rows) if changed else None
+
+
+async def _update_video_button(video_msg, prefixes, new_label, new_callback):
+    try:
+        markup = getattr(video_msg, "reply_markup", None)
+        new_markup = _replace_callback_button(
+            markup, prefixes, new_label, new_callback
+        )
+        if new_markup:
+            await video_msg.edit_reply_markup(reply_markup=new_markup)
+    except Exception as e:
+        logger.warning(f"No se pudo actualizar el botón del video: {e}")
+
+
+def _download_from_ftp(folder: str, filename: str) -> str:
+    dest_dir = tempfile.mkdtemp(prefix="social_publish_")
+    local_dest = os.path.join(dest_dir, sanitize_filename(filename))
+    ftp = None
+    try:
+        ftp = FTP(FTP_HOST)
+        ftp.login(user=FTP_USER, passwd=FTP_PASS)
+        if folder:
+            ftp.cwd(str(folder).strip("/"))
+        with open(local_dest, "wb") as f_out:
+            ftp.retrbinary(f"RETR {filename}", f_out.write)
+        return local_dest
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+
+
+async def resolve_publish_video(client: Client, target_message: Message, file_id: str):
+    """Obtiene el video desde Telegram o, si no existe, desde el FTP."""
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    if not info:
+        raise Exception("El video ya no está en el registro.")
+
+    file_name = info.get("file_name", "video.mp4")
+    tg_file_id = info.get("telegram_file_id")
+    local_path = None
+    temp_dir = tempfile.mkdtemp(prefix="social_publish_")
+    download_target = os.path.join(temp_dir, sanitize_filename(file_name))
+
+    if tg_file_id:
+        logger.info(f"[Redes] Descargando media de Telegram: {tg_file_id}")
+        try:
+            local_path = await client.download_media(
+                tg_file_id, file_name=download_target
+            )
+        except Exception as e:
+            logger.warning(f"[Redes] No se pudo descargar de Telegram: {e}")
+            local_path = None
+
+    if not local_path and target_message and (
+        target_message.video or target_message.document
+    ):
+        logger.info("[Redes] Descargando media desde el mensaje del video")
+        try:
+            local_path = await target_message.download(file_name=download_target)
+        except Exception as e:
+            logger.warning(f"[Redes] No se pudo descargar el mensaje: {e}")
+            local_path = None
+
+    if not local_path:
+        try:
+            os.rmdir(temp_dir)
+        except Exception:
+            pass
+        ftp_folder = info.get("ftp_path", "")
+        logger.info(f"[Redes] Descargando respaldo desde FTP: {ftp_folder}/{file_name}")
+        local_path = await asyncio.to_thread(
+            _download_from_ftp, ftp_folder, file_name
+        )
+
+    if not local_path or not os.path.exists(local_path):
+        raise Exception(
+            "No se pudo obtener el video desde Telegram ni desde el FTP."
+        )
+    return local_path, info
+
+
+def _cleanup_temp_video(path):
+    """Borra solo descargas temporales, nunca archivos del proyecto."""
+    if not path or not os.path.exists(path):
+        return
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    temp_root = os.path.abspath(tempfile.gettempdir())
+    downloads_root = os.path.abspath(os.path.join(os.getcwd(), "downloads"))
+    is_temp = (
+        abs_path.startswith(temp_root + os.sep)
+        or parent.startswith(downloads_root + os.sep)
+        or os.path.basename(parent).startswith("social_publish_")
+    )
+    if not is_temp:
+        logger.warning(
+            "No se elimina %s: no parece un archivo temporal de publicación.",
+            abs_path,
+        )
+        return
+    try:
+        os.remove(abs_path)
+        if os.path.basename(parent).startswith("social_publish_"):
+            try:
+                os.rmdir(parent)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def send_youtube_panel(client: Client, source_message: Message, file_id: str,
+                             admin_id: int, video_message: Message = None,
+                             edit: bool = False):
+    deletions = load_deletions()
+    info = deletions.get(file_id)
+    if not info:
+        await source_message.reply_text("❌ El video ya no está en el registro.")
+        return
+
+    caption = _social_caption(info, "youtube")
+    privacy = _youtube_privacy(info)
+    if not info.get("youtube_caption") or not info.get("youtube_privacy"):
+        info["youtube_caption"] = caption
+        info["youtube_privacy"] = privacy
+        deletions[file_id] = info
+        save_deletions(deletions)
+
+    title = _youtube_title_preview(caption, info.get("file_name", "Video"))
+    preview = caption[:600] + ("..." if len(caption) > 600 else "")
+    published_url = info.get("youtube_url")
+    stored_youtube = social_media.load_tokens().get("youtube", {}) or {}
+    channel_title = stored_youtube.get("channel_title", "")
+    channel_line = (
+        f"📺 <b>Canal:</b> {_safe_html(channel_title)}\n"
+        if channel_title
+        else ""
+    )
+    text = (
+        "📺 <b>PUBLICAR EN YOUTUBE</b>\n\n"
+        f"{channel_line}"
+        f"📁 <b>Archivo:</b> <code>{_safe_html(info.get('file_name', ''))}</code>\n"
+        f"📝 <b>Título:</b> {_safe_html(title)}\n"
+        f"📄 <b>Descripción:</b>\n{_safe_html(preview or '(sin descripción)')}\n\n"
+        f"🔒 <b>Privacidad:</b> {_youtube_privacy_label(privacy)}"
+    )
+    if published_url:
+        text += f"\n\n⚠️ Ya se publicó antes: {_safe_html(published_url)}"
+    if str(info.get("ftp_path", "")).strip("/").lower() == "youtube":
+        text += (
+            "\n\n⚠️ Este video se descargó de YouTube. Si lo publicas de nuevo, "
+            "se subirá otra copia."
+        )
+    text += "\n\n¿Publicar este video en YouTube?"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Publicar en YouTube", callback_data=f"yt_go_{file_id}")],
+        [InlineKeyboardButton("✏️ Editar texto", callback_data=f"yt_edit_{file_id}")],
+        [
+            InlineKeyboardButton("🌍 Público", callback_data=f"yt_priv_{file_id}_public"),
+            InlineKeyboardButton("🔗 No listado", callback_data=f"yt_priv_{file_id}_unlisted"),
+            InlineKeyboardButton("🔒 Privado", callback_data=f"yt_priv_{file_id}_private"),
+        ],
+        [InlineKeyboardButton("❌ Cancelar", callback_data=f"yt_cancel_{file_id}")],
+    ])
+    if edit:
+        try:
+            await source_message.edit_text(
+                text, reply_markup=keyboard, parse_mode="HTML"
+            )
+        except MessageNotModified:
+            pass
+        except Exception:
+            await source_message.reply_text(
+                text, reply_markup=keyboard, parse_mode="HTML"
+            )
+    else:
+        await source_message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+    if video_message is not None:
+        admin_states[admin_id] = {
+            "action": "youtube_panel",
+            "file_id": file_id,
+            "video_message": video_message,
+        }
+
+
+async def send_tiktok_panel(client: Client, source_message: Message, file_id: str,
+                            admin_id: int, video_message: Message = None,
+                            edit: bool = False):
+    deletions = load_deletions()
+    info = deletions.get(file_id)
+    if not info:
+        await source_message.reply_text("❌ El video ya no está en el registro.")
+        return
+
+    mode = social_media.tiktok_mode()
+    if mode == "none":
+        await source_message.reply_text(
+            "❌ TikTok no está conectado o la cuenta no tiene permisos para "
+            "publicar. Usa /conectar_tiktok primero.",
+            parse_mode="HTML",
+        )
+        return
+
+    caption = _social_caption(info, "tiktok")
+    privacy = _tiktok_privacy(info)
+    options = []
+    warning = ""
+
+    if mode == "direct":
+        try:
+            creator = await asyncio.to_thread(social_media.tiktok_creator_info)
+            options = creator.get("privacy_level_options") or []
+            if options and privacy not in options:
+                privacy = "SELF_ONLY" if "SELF_ONLY" in options else options[0]
+            if "SELF_ONLY" in options:
+                warning = (
+                    "ℹ️ Si la app no está auditada por TikTok, la única "
+                    "privacidad disponible será «Solo yo»."
+                )
+        except Exception as e:
+            warning = f"⚠️ No se pudo consultar la cuenta de TikTok: {_safe_html(e)}"
+    else:
+        privacy = "SELF_ONLY"
+        warning = (
+            "ℹ️ La app tiene permiso <b>video.upload</b>: el video se enviará "
+            "a la bandeja de entrada de TikTok. El cliente deberá abrirlo, "
+            "escribir el texto, elegir la privacidad y confirmar la publicación.\n"
+            "⚠️ Si la app no está auditada, TikTok puede limitar la visibilidad "
+            "a privado."
+        )
+
+    if not info.get("tiktok_caption") or not info.get("tiktok_privacy"):
+        info["tiktok_caption"] = caption
+        info["tiktok_privacy"] = privacy
+        deletions[file_id] = info
+        save_deletions(deletions)
+    elif privacy != info.get("tiktok_privacy"):
+        info["tiktok_privacy"] = privacy
+        deletions[file_id] = info
+        save_deletions(deletions)
+
+    stored_tiktok = social_media.load_tokens().get("tiktok", {}) or {}
+    tt_username = stored_tiktok.get("username", "")
+    tt_nickname = stored_tiktok.get("nickname", "")
+    tt_account = (
+        f"@{tt_username}"
+        if tt_username
+        else (tt_nickname or "(cuenta conectada)")
+    )
+    text = (
+        "🎵 <b>PUBLICAR EN TIKTOK</b>\n\n"
+        f"🎵 <b>Cuenta:</b> {_safe_html(tt_account)}\n"
+        f"📁 <b>Archivo:</b> <code>{_safe_html(info.get('file_name', ''))}</code>\n"
+        f"📝 <b>Texto:</b>\n{_safe_html(caption[:1200] or '(sin texto)')}\n\n"
+    )
+    if mode == "direct":
+        text += f"🔒 <b>Privacidad:</b> {_tiktok_privacy_label(privacy)}\n"
+    else:
+        text += "📨 <b>Modo:</b> Bandeja de entrada de TikTok\n"
+    if warning:
+        text += f"\n{warning}\n"
+    if info.get("tiktok_pending"):
+        text += (
+            "\n⏳ TikTok todavía está procesando el envío anterior. "
+            "No lo envíes de nuevo para evitar duplicados.\n"
+        )
+    elif info.get("tiktok_url"):
+        text += f"\n⚠️ Ya se publicó antes: {_safe_html(info['tiktok_url'])}\n"
+    elif info.get("tiktok_publish_id"):
+        text += (
+            "\n⚠️ Este video ya se envió antes a TikTok. Si lo envías de nuevo, "
+            "se creará otro borrador.\n"
+        )
+    text += "\n¿Enviar este video a TikTok?"
+
+    publish_label = (
+        "✅ Publicar en TikTok" if mode == "direct" else "📨 Enviar a TikTok"
+    )
+    rows = [[InlineKeyboardButton(publish_label, callback_data=f"tt_go_{file_id}")],
+            [InlineKeyboardButton("✏️ Editar texto", callback_data=f"tt_edit_{file_id}")]]
+    if mode == "direct" and options:
+        privacy_row = []
+        for option in options:
+            privacy_row.append(
+                InlineKeyboardButton(
+                    _tiktok_privacy_label(option),
+                    callback_data=f"tt_priv_{file_id}_{option}",
+                )
+            )
+        rows.append(privacy_row)
+    rows.append([InlineKeyboardButton("❌ Cancelar", callback_data=f"tt_cancel_{file_id}")])
+    keyboard = InlineKeyboardMarkup(rows)
+
+    if edit:
+        try:
+            await source_message.edit_text(
+                text, reply_markup=keyboard, parse_mode="HTML"
+            )
+        except MessageNotModified:
+            pass
+        except Exception:
+            await source_message.reply_text(
+                text, reply_markup=keyboard, parse_mode="HTML"
+            )
+    else:
+        await source_message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+    if video_message is not None:
+        admin_states[admin_id] = {
+            "action": "tiktok_panel",
+            "file_id": file_id,
+            "video_message": video_message,
+        }
+
+
+async def execute_youtube_publish(client: Client, video_message: Message, file_id: str,
+                                  status_message: Message = None):
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    caption = _social_caption(info, "youtube")
+    privacy = _youtube_privacy(info)
+    dry_run = os.getenv("SOCIAL_DRY_RUN", "False").lower() in ("1", "true", "yes", "si", "sí")
+
+    lock_key = f"youtube:{file_id}"
+    if lock_key in social_publish_in_progress:
+        if status_message is not None:
+            try:
+                await status_message.edit_text(
+                    "⏳ Ya hay una publicación en curso para este video."
+                )
+            except Exception:
+                pass
+        return None
+
+    if status_message is None:
+        status_message = await video_message.reply_text(
+            "⏳ Preparando el video para YouTube..."
+        )
+    else:
+        try:
+            await status_message.edit_text("⏳ Preparando el video para YouTube...")
+        except Exception:
+            pass
+
+    social_publish_in_progress.add(lock_key)
+    temp_path = None
+    try:
+        temp_path, _ = await resolve_publish_video(client, video_message, file_id)
+        try:
+            await status_message.edit_text(
+                "⏳ Subiendo video a YouTube... Esto puede tardar varios minutos."
+            )
+        except Exception:
+            pass
+        result = await asyncio.to_thread(
+            social_media.publish_video_to_youtube,
+            temp_path,
+            caption,
+            None,
+            None,
+            privacy,
+            None,
+            dry_run,
+        )
+
+        deletions = load_deletions()
+        if file_id in deletions:
+            deletions[file_id]["youtube_caption"] = caption
+            deletions[file_id]["youtube_privacy"] = result.get("privacy", privacy)
+            deletions[file_id]["youtube_dry_run"] = bool(result.get("dry_run"))
+            if not result.get("dry_run"):
+                deletions[file_id]["youtube_url"] = result.get("url", "")
+                deletions[file_id]["youtube_video_id"] = result.get("video_id", "")
+                deletions[file_id]["youtube_published_at"] = int(time.time())
+            save_deletions(deletions)
+
+        if result.get("dry_run"):
+            # Se deja el botón activo para poder publicar de verdad luego.
+            await _update_video_button(
+                video_message, ("yt_pub_",),
+                "📺 YouTube", f"yt_pub_{file_id}"
+            )
+            text = (
+                "✅ <b>Prueba de YouTube completada</b>\n\n"
+                f"📝 Título: {_safe_html(result.get('title', ''))}\n"
+                f"🔒 Privacidad: {_youtube_privacy_label(result.get('privacy', privacy))}\n\n"
+                "No se publicó nada porque SOCIAL_DRY_RUN está activo."
+            )
+        else:
+            await _update_video_button(
+                video_message, ("yt_pub_", "noop_yt_"),
+                "✅ YouTube", f"noop_yt_{file_id}"
+            )
+            text = (
+                "✅ <b>Video publicado en YouTube</b>\n\n"
+                f"🎬 {_safe_html(result.get('title', ''))}\n"
+                f"🔗 {_safe_html(result.get('url', ''))}\n"
+                f"🔒 Privacidad: {_youtube_privacy_label(result.get('privacy', privacy))}"
+            )
+        done_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Publicar de nuevo", callback_data=f"yt_pub_{file_id}")],
+            [InlineKeyboardButton("✅ Listo", callback_data=f"noop_yt_{file_id}")],
+        ])
+        await status_message.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=done_markup,
+        )
+        return result
+    except social_media.SocialAuthError as e:
+        text = (
+            "❌ <b>YouTube no está conectado o el permiso venció.</b>\n\n"
+            f"{_safe_html(e)}\n\n"
+            "Usa /conectar_youtube para vincular el canal."
+        )
+        try:
+            await status_message.edit_text(text, parse_mode="HTML")
+        except Exception:
+            pass
+    except social_media.SocialPublishError as e:
+        try:
+            await status_message.edit_text(
+                f"❌ <b>No se pudo publicar en YouTube</b>\n\n{_safe_html(e)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[YouTube] Error publicando: {e}")
+        try:
+            await status_message.edit_text(
+                f"❌ <b>Error inesperado al publicar en YouTube</b>\n\n{_safe_html(e)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    finally:
+        social_publish_in_progress.discard(lock_key)
+        _cleanup_temp_video(temp_path)
+    return None
+
+
+async def execute_tiktok_publish(client: Client, video_message: Message, file_id: str,
+                                 status_message: Message = None):
+    deletions = load_deletions()
+    info = deletions.get(file_id, {})
+    caption = _social_caption(info, "tiktok")
+    mode = social_media.tiktok_mode()
+    privacy = _tiktok_privacy(info) if mode == "direct" else "SELF_ONLY"
+    dry_run = os.getenv("SOCIAL_DRY_RUN", "False").lower() in ("1", "true", "yes", "si", "sí")
+
+    lock_key = f"tiktok:{file_id}"
+    if lock_key in social_publish_in_progress:
+        if status_message is not None:
+            try:
+                await status_message.edit_text(
+                    "⏳ Ya hay una publicación en curso para este video."
+                )
+            except Exception:
+                pass
+        return None
+
+    if status_message is None:
+        status_message = await video_message.reply_text(
+            "⏳ Preparando el video para TikTok..."
+        )
+    else:
+        try:
+            await status_message.edit_text("⏳ Preparando el video para TikTok...")
+        except Exception:
+            pass
+
+    social_publish_in_progress.add(lock_key)
+    temp_path = None
+    try:
+        temp_path, _ = await resolve_publish_video(client, video_message, file_id)
+        try:
+            await status_message.edit_text(
+                "⏳ Subiendo video a TikTok... Esto puede tardar varios minutos."
+            )
+        except Exception:
+            pass
+        result = await asyncio.to_thread(
+            social_media.publish_video_to_tiktok,
+            temp_path,
+            caption,
+            privacy,
+            dry_run,
+        )
+
+        result_mode = result.get("mode", mode)
+        deletions = load_deletions()
+        if file_id in deletions:
+            deletions[file_id]["tiktok_caption"] = caption
+            deletions[file_id]["tiktok_dry_run"] = bool(result.get("dry_run"))
+            deletions[file_id]["tiktok_pending"] = bool(result.get("pending"))
+            deletions[file_id]["tiktok_mode"] = result_mode
+            deletions[file_id]["tiktok_privacy"] = result.get("privacy", privacy)
+            if not result.get("dry_run"):
+                deletions[file_id]["tiktok_publish_id"] = result.get("publish_id", "")
+                deletions[file_id]["tiktok_url"] = result.get("url", "")
+                deletions[file_id]["tiktok_published_at"] = int(time.time())
+            save_deletions(deletions)
+
+        if result.get("dry_run"):
+            # Se deja el botón activo para poder publicar de verdad luego.
+            await _update_video_button(
+                video_message, ("tt_pub_",),
+                "🎵 TikTok", f"tt_pub_{file_id}"
+            )
+            text = (
+                "✅ <b>Prueba de TikTok completada</b>\n\n"
+                f"Modo: {'Publicación directa' if result_mode == 'direct' else 'Bandeja de entrada'}\n\n"
+                "No se publicó nada porque SOCIAL_DRY_RUN está activo."
+            )
+        elif result.get("pending"):
+            # Se deja el botón para abrir el panel y poder reintentar cuando
+            # TikTok termine de moderar.
+            await _update_video_button(
+                video_message, ("tt_pub_", "noop_tt_"),
+                "⏳ TikTok", f"tt_pub_{file_id}"
+            )
+            text = (
+                "⏳ <b>TikTok está procesando el video</b>\n\n"
+                "TikTok todavía está moderando el video. Revisa la app o el "
+                "perfil en unos minutos. No lo envíes de nuevo para evitar "
+                "duplicados."
+            )
+        elif result_mode == "inbox":
+            await _update_video_button(
+                video_message, ("tt_pub_", "noop_tt_"),
+                "📨 TikTok", f"noop_tt_{file_id}"
+            )
+            text = (
+                "📨 <b>Video enviado a la bandeja de entrada de TikTok</b>\n\n"
+                "Pide al cliente que abra TikTok, revise la notificación, "
+                "escriba el texto y confirme la publicación.\n\n"
+                f"📝 Texto sugerido:\n{_safe_html(caption)}\n\n"
+                f"{_safe_html(result.get('warning', ''))}"
+            )
+        else:
+            await _update_video_button(
+                video_message, ("tt_pub_", "noop_tt_"),
+                "✅ TikTok", f"noop_tt_{file_id}"
+            )
+            text = (
+                "✅ <b>Video publicado en TikTok</b>\n\n"
+                f"🔒 Privacidad: {_tiktok_privacy_label(result.get('privacy', privacy))}"
+            )
+            if result.get("url"):
+                text += f"\n🔗 {_safe_html(result['url'])}"
+            if result.get("warning"):
+                text += f"\n\n⚠️ {_safe_html(result['warning'])}"
+        done_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Publicar de nuevo", callback_data=f"tt_pub_{file_id}")],
+            [InlineKeyboardButton("✅ Listo", callback_data=f"noop_tt_{file_id}")],
+        ])
+        await status_message.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=done_markup,
+        )
+        return result
+    except social_media.SocialAuthError as e:
+        text = (
+            "❌ <b>TikTok no está conectado o el permiso venció.</b>\n\n"
+            f"{_safe_html(e)}\n\n"
+            "Usa /conectar_tiktok para vincular la cuenta."
+        )
+        try:
+            await status_message.edit_text(text, parse_mode="HTML")
+        except Exception:
+            pass
+    except social_media.SocialPublishError as e:
+        try:
+            await status_message.edit_text(
+                f"❌ <b>No se pudo publicar en TikTok</b>\n\n{_safe_html(e)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[TikTok] Error publicando: {e}")
+        try:
+            await status_message.edit_text(
+                f"❌ <b>Error inesperado al publicar en TikTok</b>\n\n{_safe_html(e)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    finally:
+        social_publish_in_progress.discard(lock_key)
+        _cleanup_temp_video(temp_path)
+    return None
+
 
 @app.on_message(filters.incoming & ~filters.me & (filters.video | filters.document))
 async def handle_video(client: Client, message: Message):
@@ -1264,6 +2135,10 @@ async def handle_video(client: Client, message: Message):
             save_deletions(deletions)
             
             keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📺 YouTube", callback_data=f"yt_pub_{file_id}"),
+                    InlineKeyboardButton("🎵 TikTok", callback_data=f"tt_pub_{file_id}"),
+                ],
                 [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
                 [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
@@ -1278,7 +2153,8 @@ async def handle_video(client: Client, message: Message):
                 f"👤 **Usuario:** {user_name} ({user_first} - ID: `{user_id}`)\n"
                 f"📁 **Archivo:** `{file_name}`\n"
                 f"📂 **Destino:** `{folder_display}`\n\n"
-                f"¿Cuándo deseas que se elimine automáticamente?"
+                f"¿Deseas publicarlo en YouTube/TikTok, agregarlo a la lista o "
+                f"programar su eliminación?"
             )
             
             for admin_chat_id in ADMIN_CHAT_IDS:
@@ -1613,7 +2489,7 @@ async def handle_ig_cancel_callback(client: Client, callback_query: CallbackQuer
 async def handle_noop_ig_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Este video ya fue procesado para las redes.", show_alert=True)
 
-@app.on_callback_query(filters.regex(r"^noop_"))
+@app.on_callback_query(filters.regex(r"^noop_(?!yt_|tt_|ig_)"))
 async def handle_noop_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Este archivo ya fue agregado a la lista musical.", show_alert=True)
 
@@ -1664,14 +2540,594 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     date_str = format_caracas_time(delete_timestamp)
     
     is_added = deletions[file_id].get("playlist_added", False)
-    pl_btn = InlineKeyboardButton("✅ Agregado a Lista Musical" if is_added else "🎵 Agregar a Lista Musical", callback_data=f"noop_{file_id}" if is_added else f"addpl_{file_id}")
-    
+    pl_label = "✅ Agregado a Lista Musical" if is_added else "🎵 Agregar a Lista Musical"
+    pl_callback = f"noop_{file_id}" if is_added else f"addpl_{file_id}"
+    pl_btn = InlineKeyboardButton(pl_label, callback_data=pl_callback)
+
+    # Conservar los botones de YouTube, TikTok, IG/FB y autodestrucción.
+    current_markup = callback_query.message.reply_markup
+    new_rows = []
+    playlist_found = False
+    if current_markup and current_markup.inline_keyboard:
+        for row in current_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                cb = btn.callback_data or ""
+                is_playlist_btn = cb.startswith("addpl_") or (
+                    cb.startswith("noop_")
+                    and not cb.startswith(("noop_yt_", "noop_tt_", "noop_ig_"))
+                )
+                if is_playlist_btn:
+                    new_row.append(pl_btn)
+                    playlist_found = True
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+    if not playlist_found:
+        new_rows.append([pl_btn])
+
     await edit_message_or_caption(
         callback_query.message,
         current_content + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
-        reply_markup=InlineKeyboardMarkup([[pl_btn]])
+        reply_markup=InlineKeyboardMarkup(new_rows)
     )
     await callback_query.answer("Programado exitosamente.")
+
+# ==========================================
+# CONEXIÓN DE CUENTAS DE YOUTUBE Y TIKTOK
+# ==========================================
+
+async def _poll_youtube_connection(client: Client, chat_id: int, flow: dict, flow_id: int):
+    try:
+        result = await asyncio.to_thread(
+            social_media.youtube_device_poll,
+            flow["device_code"],
+            flow.get("interval", 5),
+            flow.get("expires_in", 1800),
+        )
+        if youtube_connect_state.get("flow_id") != flow_id:
+            return
+        channel = result.get("channel", {}) or {}
+        name = channel.get("channel_title") or "(canal sin nombre)"
+        extra = ""
+        if result.get("channel_error"):
+            extra = (
+                "\n\n⚠️ El permiso quedó guardado, pero no se pudo leer el canal: "
+                f"{_safe_html(str(result['channel_error'])[:500])}\n"
+                "Revisa que YouTube Data API v3 esté habilitada en Google Cloud."
+            )
+        await client.send_message(
+            chat_id,
+            "✅ <b>YouTube conectado</b>\n\n"
+            f"📺 Canal: {_safe_html(name)}\n"
+            "Ya puedes publicar videos desde los botones de cada video."
+            f"{extra}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        if youtube_connect_state.get("flow_id") == flow_id:
+            try:
+                await client.send_message(
+                    chat_id,
+                    f"❌ <b>No se pudo conectar YouTube</b>\n\n{_safe_html(e)}\n\n"
+                    "Genera un código nuevo con /conectar_youtube.",
+                    parse_mode="HTML",
+                )
+            except Exception as e2:
+                logger.error(f"No se pudo notificar el error de YouTube: {e2}")
+    finally:
+        if youtube_connect_state.get("flow_id") == flow_id:
+            youtube_connect_state["active"] = False
+            youtube_connect_state["task"] = None
+
+
+async def _poll_tiktok_connection(client: Client, chat_id: int, flow: dict, flow_id: int):
+    try:
+        result = await asyncio.to_thread(
+            social_media.tiktok_qr_poll,
+            flow["token"],
+            flow["client_ticket"],
+            3,
+            600,
+        )
+        if tiktok_connect_state.get("flow_id") != flow_id:
+            return
+        mode = social_media.tiktok_mode()
+        creator = result.get("creator", {}) or {}
+        stored = social_media.load_tokens().get("tiktok", {}) or {}
+        username = creator.get("creator_username") or stored.get("username", "")
+        nickname = creator.get("creator_nickname") or stored.get("nickname", "")
+        account = (
+            f"@{username}"
+            if username
+            else (nickname or "(cuenta conectada)")
+        )
+        if mode == "direct":
+            if creator:
+                mode_text = "Publicación directa habilitada."
+            else:
+                mode_text = (
+                    "La cuenta se conectó, pero no se pudo consultar la "
+                    "información de publicación. Revisa /redes y los permisos "
+                    "de la app en TikTok."
+                )
+        elif mode == "inbox":
+            mode_text = (
+                "La app tiene permiso video.upload: los videos se enviarán a la "
+                "bandeja de entrada de TikTok y el cliente deberá confirmarlos en la app.\n"
+                "Para publicación automática hay que aprobar video.publish y pasar "
+                "la auditoría de TikTok."
+            )
+        else:
+            mode_text = (
+                "La cuenta se conectó, pero la app no tiene permiso para publicar "
+                "videos. Revisa los scopes en el portal de TikTok."
+            )
+        await client.send_message(
+            chat_id,
+            "✅ <b>TikTok conectado</b>\n\n"
+            f"🎵 Cuenta: {_safe_html(account)}\n"
+            f"{_safe_html(mode_text)}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        if tiktok_connect_state.get("flow_id") == flow_id:
+            try:
+                await client.send_message(
+                    chat_id,
+                    f"❌ <b>No se pudo conectar TikTok</b>\n\n{_safe_html(e)}\n\n"
+                    "Genera un QR nuevo con /conectar_tiktok.",
+                    parse_mode="HTML",
+                )
+            except Exception as e2:
+                logger.error(f"No se pudo notificar el error de TikTok: {e2}")
+    finally:
+        if tiktok_connect_state.get("flow_id") == flow_id:
+            tiktok_connect_state["active"] = False
+            tiktok_connect_state["task"] = None
+        try:
+            os.remove(flow.get("qr_path", ""))
+        except Exception:
+            pass
+
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("conectar_youtube") & filters.private)
+async def cmd_connect_youtube(client: Client, message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.reply_text("❌ Solo administradores pueden conectar YouTube.")
+        return
+    if youtube_connect_state.get("active"):
+        old_task = youtube_connect_state.get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        youtube_connect_state["active"] = False
+        youtube_connect_state["task"] = None
+
+    status_msg = await message.reply_text("⏳ Generando código de Google...")
+    try:
+        flow = await asyncio.to_thread(social_media.youtube_device_start)
+    except Exception as e:
+        await status_msg.edit_text(
+            "❌ <b>No se pudo generar el código de YouTube</b>\n\n"
+            f"{_safe_html(e)}\n\n"
+            "Revisa que YOUTUBE_DEVICE_CLIENT_ID y YOUTUBE_DEVICE_CLIENT_SECRET "
+            "sean de tipo «TVs and Limited Input devices» en Google Cloud.",
+            parse_mode="HTML",
+        )
+        return
+
+    code = flow.get("user_code", "")
+    url = flow.get("verification_url", "https://www.google.com/device")
+    expires_min = max(1, int(flow.get("expires_in", 1800) / 60))
+    text = (
+        "📺 <b>CONECTAR YOUTUBE</b>\n\n"
+        "Reenvía este mensaje al cliente o pídele que haga esto:\n\n"
+        f"1️⃣ Abre: {_safe_html(url)}\n"
+        f"2️⃣ Escribe este código: <code>{_safe_html(code)}</code>\n"
+        "3️⃣ Inicia sesión con la cuenta dueña del canal y acepta el permiso.\n"
+        "   Si Google muestra un aviso de app no verificada, entra en "
+        "«Configuración avanzada» y continúa.\n\n"
+        f"⏳ El código vence en {expires_min} minutos.\n"
+        "Cuando el cliente termine, te aviso por aquí."
+    )
+    await status_msg.edit_text(
+        text, parse_mode="HTML", disable_web_page_preview=True
+    )
+    flow_id = int(youtube_connect_state.get("flow_id", 0)) + 1
+    youtube_connect_state.update(
+        {
+            "active": True,
+            "started_at": time.time(),
+            "admin_id": message.from_user.id,
+            "flow_id": flow_id,
+        }
+    )
+    task = asyncio.create_task(
+        _poll_youtube_connection(client, message.chat.id, flow, flow_id)
+    )
+    youtube_connect_state["task"] = task
+
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("conectar_tiktok") & filters.private)
+async def cmd_connect_tiktok(client: Client, message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.reply_text("❌ Solo administradores pueden conectar TikTok.")
+        return
+    if tiktok_connect_state.get("active"):
+        old_task = tiktok_connect_state.get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        tiktok_connect_state["active"] = False
+        tiktok_connect_state["task"] = None
+
+    status_msg = await message.reply_text("⏳ Generando código QR de TikTok...")
+    try:
+        flow = await asyncio.to_thread(social_media.tiktok_qr_start)
+    except Exception as e:
+        await status_msg.edit_text(
+            "❌ <b>No se pudo generar el QR de TikTok</b>\n\n"
+            f"{_safe_html(e)}\n\n"
+            "Revisa que la app tenga Login Kit y los scopes video.publish o "
+            "video.upload aprobados en el portal de TikTok.",
+            parse_mode="HTML",
+        )
+        return
+
+    scope = flow.get("scope", "")
+    if "video.publish" in scope:
+        mode_text = "Publicación directa habilitada."
+    elif "video.upload" in scope:
+        mode_text = (
+            "Bandeja de entrada: el cliente deberá confirmar la publicación en TikTok."
+        )
+    else:
+        mode_text = (
+            "La app solo tiene permiso de perfil; no podrá publicar videos."
+        )
+
+    caption = (
+        "🎵 <b>CONECTAR TIKTOK</b>\n\n"
+        "Reenvía este código QR al cliente o pídele que haga esto:\n\n"
+        "1️⃣ Abre TikTok en el teléfono.\n"
+        "2️⃣ Toca el ícono de escanear QR.\n"
+        "3️⃣ Escanea este código y acepta el permiso.\n\n"
+        f"ℹ️ {mode_text}\n"
+        "Cuando el cliente termine, te aviso por aquí."
+    )
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    # Se envía como documento para que Telegram no comprima el QR.
+    await message.reply_document(
+        flow["qr_path"], caption=caption, parse_mode="HTML"
+    )
+    flow_id = int(tiktok_connect_state.get("flow_id", 0)) + 1
+    tiktok_connect_state.update(
+        {
+            "active": True,
+            "started_at": time.time(),
+            "admin_id": message.from_user.id,
+            "flow_id": flow_id,
+        }
+    )
+    task = asyncio.create_task(
+        _poll_tiktok_connection(client, message.chat.id, flow, flow_id)
+    )
+    tiktok_connect_state["task"] = task
+
+
+@app.on_message(filters.incoming & ~filters.me & filters.command("redes") & filters.private)
+async def cmd_social_status(client: Client, message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.reply_text("❌ Solo administradores pueden ver el estado de las redes.")
+        return
+    status_msg = await message.reply_text(
+        "⏳ Consultando estado de YouTube y TikTok..."
+    )
+    try:
+        status = await asyncio.to_thread(social_media.check_connections)
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ No se pudo consultar el estado: {_safe_html(e)}",
+            parse_mode="HTML",
+        )
+        return
+
+    yt = status.get("youtube", {})
+    tt = status.get("tiktok", {})
+    lines = ["📡 <b>ESTADO DE REDES SOCIALES</b>", ""]
+
+    if yt.get("connected"):
+        icon = "✅" if yt.get("valid") else "⚠️"
+        channel = yt.get("channel_title") or "(canal sin nombre)"
+        lines.append(f"📺 <b>YouTube:</b> {icon} {_safe_html(channel)}")
+        if yt.get("error"):
+            lines.append(f"   ⚠️ {_safe_html(str(yt['error'])[:300])}")
+    else:
+        lines.append("📺 <b>YouTube:</b> ❌ No conectado")
+        lines.append("   Usa /conectar_youtube")
+
+    lines.append("")
+
+    if tt.get("connected"):
+        icon = "✅" if tt.get("valid") else "⚠️"
+        username = tt.get("username") or ""
+        nickname = tt.get("nickname") or ""
+        account = f"@{username}" if username else (nickname or "(cuenta conectada)")
+        mode = tt.get("mode", "none")
+        mode_label = {
+            "direct": "Publicación directa",
+            "inbox": "Bandeja de entrada (el cliente confirma en TikTok)",
+            "none": "Sin permiso de publicación",
+        }.get(mode, mode)
+        lines.append(f"🎵 <b>TikTok:</b> {icon} {_safe_html(account)}")
+        lines.append(f"   Modo: {_safe_html(mode_label)}")
+        if tt.get("error"):
+            lines.append(f"   ⚠️ {_safe_html(str(tt['error'])[:300])}")
+    else:
+        lines.append("🎵 <b>TikTok:</b> ❌ No conectado")
+        lines.append("   Usa /conectar_tiktok")
+
+    lines.append("")
+    lines.append(
+        "Puedes reconectar cuando quieras con /conectar_youtube o /conectar_tiktok."
+    )
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
+# ==========================================
+# CALLBACKS DE PUBLICACIÓN EN YOUTUBE / TIKTOK
+# ==========================================
+
+@app.on_callback_query(filters.regex(r"^yt_pub_"))
+async def handle_youtube_publish_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer(
+            "❌ Solo administradores pueden publicar en YouTube.", show_alert=True
+        )
+        return
+    if not social_media.local_status().get("youtube", {}).get("connected"):
+        await callback_query.answer(
+            "❌ YouTube no está conectado. Usa /conectar_youtube.",
+            show_alert=True,
+        )
+        return
+    file_id = callback_query.data.partition("yt_pub_")[2]
+    await callback_query.answer()
+    await send_youtube_panel(
+        client,
+        callback_query.message,
+        file_id,
+        callback_query.from_user.id,
+        video_message=callback_query.message,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^tt_pub_"))
+async def handle_tiktok_publish_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer(
+            "❌ Solo administradores pueden publicar en TikTok.", show_alert=True
+        )
+        return
+    if social_media.tiktok_mode() == "none":
+        await callback_query.answer(
+            "❌ TikTok no está conectado o no tiene permisos. Usa /conectar_tiktok.",
+            show_alert=True,
+        )
+        return
+    file_id = callback_query.data.partition("tt_pub_")[2]
+    await callback_query.answer()
+    await send_tiktok_panel(
+        client,
+        callback_query.message,
+        file_id,
+        callback_query.from_user.id,
+        video_message=callback_query.message,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^yt_go_"))
+async def handle_youtube_go_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    file_id = callback_query.data.partition("yt_go_")[2]
+    state = admin_states.pop(admin_id, {})
+    video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
+    await callback_query.answer("🚀 Subiendo a YouTube...")
+    await execute_youtube_publish(
+        client, video_msg, file_id, status_message=callback_query.message
+    )
+
+
+@app.on_callback_query(filters.regex(r"^tt_go_"))
+async def handle_tiktok_go_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    file_id = callback_query.data.partition("tt_go_")[2]
+    state = admin_states.pop(admin_id, {})
+    video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
+    await callback_query.answer("🚀 Enviando a TikTok...")
+    await execute_tiktok_publish(
+        client, video_msg, file_id, status_message=callback_query.message
+    )
+
+
+@app.on_callback_query(filters.regex(r"^yt_edit_"))
+async def handle_youtube_edit_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    file_id = callback_query.data.partition("yt_edit_")[2]
+    state = admin_states.get(admin_id, {})
+    video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
+    admin_states[admin_id] = {
+        "action": "awaiting_youtube_caption",
+        "file_id": file_id,
+        "video_message": video_msg,
+        "panel_message": callback_query.message,
+    }
+    await callback_query.message.edit_text(
+        "✏️ <b>Escribe el nuevo texto para YouTube.</b>\n\n"
+        "La primera línea será el título (máximo 100 caracteres) y el resto "
+        "será la descripción.\n\n"
+        "Envíalo en el chat y te mostraré la vista previa.",
+        parse_mode="HTML",
+    )
+    await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^tt_edit_"))
+async def handle_tiktok_edit_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    file_id = callback_query.data.partition("tt_edit_")[2]
+    state = admin_states.get(admin_id, {})
+    video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
+    admin_states[admin_id] = {
+        "action": "awaiting_tiktok_caption",
+        "file_id": file_id,
+        "video_message": video_msg,
+        "panel_message": callback_query.message,
+    }
+    await callback_query.message.edit_text(
+        "✏️ <b>Escribe el nuevo texto para TikTok.</b>\n\n"
+        "Puedes incluir hashtags (#) y menciones (@). Máximo 2200 caracteres.\n\n"
+        "Envíalo en el chat y te mostraré la vista previa.",
+        parse_mode="HTML",
+    )
+    await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^yt_priv_"))
+async def handle_youtube_privacy_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    rest = callback_query.data.partition("yt_priv_")[2]
+    file_id, _, privacy = rest.partition("_")
+    if privacy not in ("public", "unlisted", "private"):
+        await callback_query.answer("Privacidad inválida.", show_alert=True)
+        return
+    deletions = load_deletions()
+    if file_id not in deletions:
+        await callback_query.answer("El video ya no está en el registro.", show_alert=True)
+        return
+    deletions[file_id]["youtube_privacy"] = privacy
+    save_deletions(deletions)
+    state = admin_states.get(admin_id, {})
+    video_msg = state.get("video_message")
+    await send_youtube_panel(
+        client,
+        callback_query.message,
+        file_id,
+        admin_id,
+        video_message=video_msg,
+        edit=True,
+    )
+    await callback_query.answer(f"Privacidad: {_youtube_privacy_label(privacy)}")
+
+
+@app.on_callback_query(filters.regex(r"^tt_priv_"))
+async def handle_tiktok_privacy_callback(client: Client, callback_query: CallbackQuery):
+    admin_id = callback_query.from_user.id
+    if not is_admin(admin_id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    rest = callback_query.data.partition("tt_priv_")[2]
+    file_id, _, privacy = rest.partition("_")
+    if privacy not in social_media.TIKTOK_PRIVACY_LABELS:
+        await callback_query.answer("Privacidad inválida.", show_alert=True)
+        return
+    deletions = load_deletions()
+    if file_id not in deletions:
+        await callback_query.answer("El video ya no está en el registro.", show_alert=True)
+        return
+    deletions[file_id]["tiktok_privacy"] = privacy
+    save_deletions(deletions)
+    state = admin_states.get(admin_id, {})
+    video_msg = state.get("video_message")
+    await send_tiktok_panel(
+        client,
+        callback_query.message,
+        file_id,
+        admin_id,
+        video_message=video_msg,
+        edit=True,
+    )
+    await callback_query.answer(f"Privacidad: {_tiktok_privacy_label(privacy)}")
+
+
+@app.on_callback_query(filters.regex(r"^yt_cancel_"))
+async def handle_youtube_cancel_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    admin_states.pop(callback_query.from_user.id, None)
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    await callback_query.answer("Operación cancelada.")
+
+
+@app.on_callback_query(filters.regex(r"^tt_cancel_"))
+async def handle_tiktok_cancel_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ No autorizado.", show_alert=True)
+        return
+    admin_states.pop(callback_query.from_user.id, None)
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    await callback_query.answer("Operación cancelada.")
+
+
+@app.on_callback_query(filters.regex(r"^noop_yt_"))
+async def handle_noop_youtube_callback(client: Client, callback_query: CallbackQuery):
+    file_id = callback_query.data.partition("noop_yt_")[2]
+    info = load_deletions().get(file_id, {})
+    url = info.get("youtube_url")
+    if url:
+        await callback_query.answer(f"Ya publicado en YouTube: {url}", show_alert=True)
+    elif info.get("youtube_dry_run"):
+        await callback_query.answer("Este video ya fue probado para YouTube.", show_alert=True)
+    else:
+        await callback_query.answer("Este video ya fue procesado para YouTube.", show_alert=True)
+
+
+@app.on_callback_query(filters.regex(r"^noop_tt_"))
+async def handle_noop_tiktok_callback(client: Client, callback_query: CallbackQuery):
+    file_id = callback_query.data.partition("noop_tt_")[2]
+    info = load_deletions().get(file_id, {})
+    if info.get("tiktok_pending"):
+        await callback_query.answer(
+            "TikTok todavía está procesando este video.", show_alert=True
+        )
+    elif info.get("tiktok_dry_run"):
+        await callback_query.answer("Este video ya fue probado en TikTok.", show_alert=True)
+    elif info.get("tiktok_mode") == "inbox":
+        await callback_query.answer(
+            "El video ya fue enviado a la bandeja de entrada de TikTok.",
+            show_alert=True,
+        )
+    elif info.get("tiktok_url"):
+        await callback_query.answer(
+            f"Ya publicado en TikTok: {info['tiktok_url']}", show_alert=True
+        )
+    else:
+        await callback_query.answer("Este video ya fue procesado para TikTok.", show_alert=True)
+
 
 @app.on_message(filters.incoming & ~filters.me & filters.text & filters.private)
 async def handle_admin_text(client: Client, message: Message):
@@ -1697,6 +3153,45 @@ async def handle_admin_text(client: Client, message: Message):
         await execute_meta_publish(client, video_msg, file_id, new_caption)
         return
 
+    if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_youtube_caption":
+        state = admin_states.pop(admin_id)
+        file_id = state["file_id"]
+        video_msg = state.get("video_message")
+        new_caption = (message.text or "").strip()
+        deletions = load_deletions()
+        if file_id in deletions:
+            deletions[file_id]["youtube_caption"] = new_caption
+            save_deletions(deletions)
+        panel_message = state.get("panel_message")
+        if panel_message:
+            try:
+                await panel_message.delete()
+            except Exception:
+                pass
+        await send_youtube_panel(
+            client, message, file_id, admin_id, video_message=video_msg
+        )
+        return
+
+    if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_tiktok_caption":
+        state = admin_states.pop(admin_id)
+        file_id = state["file_id"]
+        video_msg = state.get("video_message")
+        new_caption = (message.text or "").strip()[:2200]
+        deletions = load_deletions()
+        if file_id in deletions:
+            deletions[file_id]["tiktok_caption"] = new_caption
+            save_deletions(deletions)
+        panel_message = state.get("panel_message")
+        if panel_message:
+            try:
+                await panel_message.delete()
+            except Exception:
+                pass
+        await send_tiktok_panel(
+            client, message, file_id, admin_id, video_message=video_msg
+        )
+        return
 
     if admin_id in admin_states and admin_states[admin_id].get("action") == "awaiting_custom_date":
         file_id = admin_states[admin_id]["file_id"]
@@ -1744,13 +3239,18 @@ async def handle_admin_text(client: Client, message: Message):
         yt_url = yt_match.group(1)
         status_msg = await message.reply_text(
             f"🎬 **Enlace de YouTube detectado:**\n`{yt_url}`\n\n"
-            f"⏳ Conectando con YouTube y descargando en **1080p** (con audio fusionado)..."
+            f"⏳ Conectando con YouTube y descargando en **hasta 1080p** (con audio fusionado)..."
         )
 
         # 1. Descargar en segundo plano
         success, local_path, video_title, err = await asyncio.to_thread(download_youtube_video, yt_url)
         if not success or not os.path.exists(local_path):
-            await status_msg.edit_text(f"❌ **Error al descargar video de YouTube:**\n`{err or 'Fallo desconocido'}`")
+            err_text = err or "Fallo desconocido"
+            if len(err_text) > 1500:
+                err_text = err_text[:1500] + "..."
+            await status_msg.edit_text(
+                f"❌ **Error al descargar video de YouTube:**\n`{err_text}`"
+            )
             return
 
         file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
@@ -1786,6 +3286,10 @@ async def handle_admin_text(client: Client, message: Message):
             save_deletions(deletions)
 
             keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📺 YouTube", callback_data=f"yt_pub_{file_id}"),
+                    InlineKeyboardButton("🎵 TikTok", callback_data=f"tt_pub_{file_id}"),
+                ],
                 [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
                 [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
@@ -1802,7 +3306,8 @@ async def handle_admin_text(client: Client, message: Message):
                 f"📁 **Archivo:** `{base_name}` ({file_size_mb:.2f} MB)\n"
                 f"📂 **Destino FTP:** `{folder_display}`\n"
                 f"👤 **Descargado por:** {user_first} (ID: `{admin_id}`)\n\n"
-                f"¿Deseas agregarlo a la lista musical, publicarlo en redes o programar su eliminación?"
+                f"¿Deseas publicarlo en YouTube/TikTok, agregarlo a la lista o "
+                f"programar su eliminación?"
             )
 
             await status_msg.edit_text(confirm_text, reply_markup=keyboard)

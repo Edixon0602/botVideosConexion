@@ -13,7 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     tzdata \
     ffmpeg \
+    curl \
+    unzip \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno es necesario para que yt-dlp resuelva los desafíos JavaScript de YouTube.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && /usr/local/bin/deno --version
 
 WORKDIR /app
 

@@ -19,3 +19,10 @@ downloads/
 *.mp4
 *.mkv
 *.avi
+
+# Tokens de YouTube / TikTok (nunca subir al repositorio)
+social_tokens.json
+social_tokens.json.tmp.*
+data/
+# Cookies de sesión de Google/YouTube (nunca subir al repositorio)
+cookies.txt
