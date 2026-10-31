@@ -399,7 +399,8 @@ def _youtube_deno_path():
     return shutil.which("deno")
 
 
-def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None):
+def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None,
+                      clients=None):
     out_template = os.path.join(
         output_dir, f"{run_id}_%(id)s_%(title).80s.%(ext)s"
     )
@@ -426,9 +427,10 @@ def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None):
         "concurrent_fragment_downloads": 4,
         "extractor_args": {
             "youtube": {
-                # web_safari/android fallan con "Sign in to confirm" en VPS.
-                # web_embedded y mweb entregan 1080p sin ese bloqueo.
-                "player_client": ["web_embedded", "mweb", "tv", "web"],
+                # Se prueba un cliente por intento: si se pasan varios juntos,
+                # un cliente con "Sign in to confirm" puede abortar la extracción
+                # completa y desperdiciar los clientes que sí funcionan.
+                "player_client": clients or ["web_embedded"],
             }
         },
         "postprocessors": [{
@@ -454,7 +456,7 @@ def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None):
 
 
 def _youtube_attempt(url: str, output_dir: str, run_id: str,
-                     cookie_file: str = None):
+                     cookie_file: str = None, clients=None):
     import yt_dlp
     # Se usa una copia temporal para que yt-dlp no reescriba cookies.txt.
     cookie_copy = None
@@ -476,7 +478,7 @@ def _youtube_attempt(url: str, output_dir: str, run_id: str,
                 pass
             raise
     try:
-        opts = _youtube_ydl_opts(output_dir, run_id, cookie_copy)
+        opts = _youtube_ydl_opts(output_dir, run_id, cookie_copy, clients)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     finally:
@@ -542,17 +544,28 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
             "los desafíos de YouTube o descargar en baja calidad."
         )
 
-    attempts = []
-    if cookie_file:
-        attempts.append(("con cookies", cookie_file))
-    attempts.append(("sin cookies", None))
+    # Se intenta un cliente por vez. Si se pasan varios en la misma lista,
+    # un cliente bloqueado puede abortar la extracción completa.
+    clients_env = os.getenv(
+        "YOUTUBE_PLAYER_CLIENTS",
+        "web_embedded,mweb,tv,web,android_vr",
+    )
+    client_names = [c.strip() for c in clients_env.split(",") if c.strip()]
+    if not client_names:
+        client_names = ["web_embedded"]
 
-    for label, cookiefile in attempts:
+    attempts = []
+    for client in client_names:
+        if cookie_file:
+            attempts.append((f"con cookies/{client}", cookie_file, [client]))
+        attempts.append((f"sin cookies/{client}", None, [client]))
+
+    for label, cookiefile, clients in attempts:
         run_id = f"yt_{uuid.uuid4().hex[:10]}"
         try:
             logger.info(f"[YouTube] Intentando descarga {label}: {url}")
             path, title = _youtube_attempt(
-                url, output_dir, run_id, cookiefile
+                url, output_dir, run_id, cookiefile, clients
             )
             if path and os.path.exists(path):
                 logger.info(f"[YouTube] Descarga exitosa ({label}): {path}")
