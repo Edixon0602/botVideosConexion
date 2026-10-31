@@ -24,7 +24,7 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import uuid
@@ -1604,16 +1604,16 @@ async def send_youtube_panel(client: Client, source_message: Message, file_id: s
     if edit:
         try:
             await source_message.edit_text(
-                text, reply_markup=keyboard, parse_mode="html"
+                text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML
             )
         except MessageNotModified:
             pass
         except Exception:
             await source_message.reply_text(
-                text, reply_markup=keyboard, parse_mode="html"
+                text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML
             )
     else:
-        await source_message.reply_text(text, reply_markup=keyboard, parse_mode="html")
+        await source_message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
 
     if video_message is not None:
         admin_states[admin_id] = {
@@ -1637,7 +1637,7 @@ async def send_tiktok_panel(client: Client, source_message: Message, file_id: st
         await source_message.reply_text(
             "❌ TikTok no está conectado o la cuenta no tiene permisos para "
             "publicar. Usa /conectar_tiktok primero.",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
@@ -1734,16 +1734,16 @@ async def send_tiktok_panel(client: Client, source_message: Message, file_id: st
     if edit:
         try:
             await source_message.edit_text(
-                text, reply_markup=keyboard, parse_mode="html"
+                text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML
             )
         except MessageNotModified:
             pass
         except Exception:
             await source_message.reply_text(
-                text, reply_markup=keyboard, parse_mode="html"
+                text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML
             )
     else:
-        await source_message.reply_text(text, reply_markup=keyboard, parse_mode="html")
+        await source_message.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
 
     if video_message is not None:
         admin_states[admin_id] = {
@@ -1843,7 +1843,7 @@ async def execute_youtube_publish(client: Client, video_message: Message, file_i
         ])
         await status_message.edit_text(
             text,
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=done_markup,
         )
@@ -1855,14 +1855,14 @@ async def execute_youtube_publish(client: Client, video_message: Message, file_i
             "Usa /conectar_youtube para vincular el canal."
         )
         try:
-            await status_message.edit_text(text, parse_mode="html")
+            await status_message.edit_text(text, parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     except social_media.SocialPublishError as e:
         try:
             await status_message.edit_text(
                 f"❌ <b>No se pudo publicar en YouTube</b>\n\n{_safe_html(e)}",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -1871,7 +1871,7 @@ async def execute_youtube_publish(client: Client, video_message: Message, file_i
         try:
             await status_message.edit_text(
                 f"❌ <b>Error inesperado al publicar en YouTube</b>\n\n{_safe_html(e)}",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -1998,7 +1998,7 @@ async def execute_tiktok_publish(client: Client, video_message: Message, file_id
         ])
         await status_message.edit_text(
             text,
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=done_markup,
         )
@@ -2010,14 +2010,14 @@ async def execute_tiktok_publish(client: Client, video_message: Message, file_id
             "Usa /conectar_tiktok para vincular la cuenta."
         )
         try:
-            await status_message.edit_text(text, parse_mode="html")
+            await status_message.edit_text(text, parse_mode=enums.ParseMode.HTML)
         except Exception:
             pass
     except social_media.SocialPublishError as e:
         try:
             await status_message.edit_text(
                 f"❌ <b>No se pudo publicar en TikTok</b>\n\n{_safe_html(e)}",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -2026,7 +2026,7 @@ async def execute_tiktok_publish(client: Client, video_message: Message, file_id
         try:
             await status_message.edit_text(
                 f"❌ <b>Error inesperado al publicar en TikTok</b>\n\n{_safe_html(e)}",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -2627,7 +2627,7 @@ async def _poll_youtube_connection(client: Client, chat_id: int, flow: dict, flo
             f"📺 Canal: {_safe_html(name)}\n"
             "Ya puedes publicar videos desde los botones de cada video."
             f"{extra}",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
     except Exception as e:
         if youtube_connect_state.get("flow_id") == flow_id:
@@ -2636,7 +2636,7 @@ async def _poll_youtube_connection(client: Client, chat_id: int, flow: dict, flo
                     chat_id,
                     f"❌ <b>No se pudo conectar YouTube</b>\n\n{_safe_html(e)}\n\n"
                     "Genera un código nuevo con /conectar_youtube.",
-                    parse_mode="html",
+                    parse_mode=enums.ParseMode.HTML,
                 )
             except Exception as e2:
                 logger.error(f"No se pudo notificar el error de YouTube: {e2}")
@@ -2693,7 +2693,7 @@ async def _poll_tiktok_connection(client: Client, chat_id: int, flow: dict, flow
             "✅ <b>TikTok conectado</b>\n\n"
             f"🎵 Cuenta: {_safe_html(account)}\n"
             f"{_safe_html(mode_text)}",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
     except Exception as e:
         if tiktok_connect_state.get("flow_id") == flow_id:
@@ -2702,7 +2702,7 @@ async def _poll_tiktok_connection(client: Client, chat_id: int, flow: dict, flow
                     chat_id,
                     f"❌ <b>No se pudo conectar TikTok</b>\n\n{_safe_html(e)}\n\n"
                     "Genera un QR nuevo con /conectar_tiktok.",
-                    parse_mode="html",
+                    parse_mode=enums.ParseMode.HTML,
                 )
             except Exception as e2:
                 logger.error(f"No se pudo notificar el error de TikTok: {e2}")
@@ -2737,7 +2737,7 @@ async def cmd_connect_youtube(client: Client, message: Message):
             f"{_safe_html(e)}\n\n"
             "Revisa que YOUTUBE_DEVICE_CLIENT_ID y YOUTUBE_DEVICE_CLIENT_SECRET "
             "sean de tipo «TVs and Limited Input devices» en Google Cloud.",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
@@ -2765,7 +2765,7 @@ async def cmd_connect_youtube(client: Client, message: Message):
         "Cuando el cliente termine, te aviso por aquí."
     )
     await status_msg.edit_text(
-        text, parse_mode="html", disable_web_page_preview=True
+        text, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True
     )
     flow_id = int(youtube_connect_state.get("flow_id", 0)) + 1
     youtube_connect_state.update(
@@ -2803,7 +2803,7 @@ async def cmd_connect_tiktok(client: Client, message: Message):
             f"{_safe_html(e)}\n\n"
             "Revisa que la app tenga Login Kit y los scopes video.publish o "
             "video.upload aprobados en el portal de TikTok.",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
@@ -2841,7 +2841,7 @@ async def cmd_connect_tiktok(client: Client, message: Message):
         pass
     # Se envía como documento para que Telegram no comprima el QR.
     await message.reply_document(
-        flow["qr_path"], caption=caption, parse_mode="html"
+        flow["qr_path"], caption=caption, parse_mode=enums.ParseMode.HTML
     )
     flow_id = int(tiktok_connect_state.get("flow_id", 0)) + 1
     tiktok_connect_state.update(
@@ -2871,7 +2871,7 @@ async def cmd_social_status(client: Client, message: Message):
     except Exception as e:
         await status_msg.edit_text(
             f"❌ No se pudo consultar el estado: {_safe_html(e)}",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
@@ -2920,7 +2920,7 @@ async def cmd_social_status(client: Client, message: Message):
     lines.append(
         "Puedes reconectar cuando quieras con /conectar_youtube o /conectar_tiktok."
     )
-    await status_msg.edit_text("\n".join(lines), parse_mode="html")
+    await status_msg.edit_text("\n".join(lines), parse_mode=enums.ParseMode.HTML)
 
 
 # ==========================================
@@ -3025,7 +3025,7 @@ async def handle_youtube_edit_callback(client: Client, callback_query: CallbackQ
         "La primera línea será el título (máximo 100 caracteres) y el resto "
         "será la descripción.\n\n"
         "Envíalo en el chat y te mostraré la vista previa.",
-        parse_mode="html",
+        parse_mode=enums.ParseMode.HTML,
     )
     await callback_query.answer()
 
@@ -3049,7 +3049,7 @@ async def handle_tiktok_edit_callback(client: Client, callback_query: CallbackQu
         "✏️ <b>Escribe el nuevo texto para TikTok.</b>\n\n"
         "Puedes incluir hashtags (#) y menciones (@). Máximo 2200 caracteres.\n\n"
         "Envíalo en el chat y te mostraré la vista previa.",
-        parse_mode="html",
+        parse_mode=enums.ParseMode.HTML,
     )
     await callback_query.answer()
 
