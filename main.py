@@ -2681,6 +2681,30 @@ async def _poll_tiktok_connection(client: Client, chat_id: int, flow: dict, flow
             if username
             else (nickname or "(cuenta conectada)")
         )
+        expected_username = os.getenv("TIKTOK_USERNAME", "").strip().lstrip("@").lower()
+        connected_username = (username or "").strip().lstrip("@").lower()
+        if (
+            expected_username
+            and connected_username
+            and expected_username != connected_username
+        ):
+            # Igual que en YouTube: no guardamos una cuenta equivocada.
+            social_media.disconnect("tiktok")
+            logger.warning(
+                "TikTok conectado a la cuenta equivocada: @%s (esperada @%s)",
+                connected_username,
+                expected_username,
+            )
+            await client.send_message(
+                chat_id,
+                "❌ <b>No se guardó la conexión de TikTok</b>\n\n"
+                f"Se autorizó la cuenta <b>@{_safe_html(connected_username)}</b>, "
+                f"pero se esperaba <b>@{_safe_html(expected_username)}</b>.\n\n"
+                "Vuelve a ejecutar /conectar_tiktok y escanea el QR con la cuenta "
+                "correcta. No se publicará nada en la cuenta equivocada.",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            return
         if mode == "direct":
             if creator:
                 mode_text = "Publicación directa habilitada."
@@ -2841,7 +2865,8 @@ async def cmd_connect_tiktok(client: Client, message: Message):
 
     expected_tiktok = os.getenv("TIKTOK_USERNAME", "").strip()
     account_line = (
-        f"🎵 Cuenta: {_safe_html(expected_tiktok)}\n\n"
+        f"🎵 Cuenta: {_safe_html(expected_tiktok)}\n"
+        "   ⚠️ Si TikTok está abierto con otra cuenta, cámbiala antes de escanear.\n\n"
         if expected_tiktok
         else ""
     )
