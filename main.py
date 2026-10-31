@@ -426,7 +426,9 @@ def _youtube_ydl_opts(output_dir: str, run_id: str, cookie_file: str = None):
         "concurrent_fragment_downloads": 4,
         "extractor_args": {
             "youtube": {
-                "player_client": ["web_safari", "web_embedded", "android_vr"],
+                # web_safari/android fallan con "Sign in to confirm" en VPS.
+                # web_embedded y mweb entregan 1080p sin ese bloqueo.
+                "player_client": ["web_embedded", "mweb", "tv", "web"],
             }
         },
         "postprocessors": [{
