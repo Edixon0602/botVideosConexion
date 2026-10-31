@@ -2734,12 +2734,21 @@ async def cmd_connect_youtube(client: Client, message: Message):
     code = flow.get("user_code", "")
     url = flow.get("verification_url", "https://www.google.com/device")
     expires_min = max(1, int(flow.get("expires_in", 1800) / 60))
+    expected_channel = os.getenv("YOUTUBE_CHANNEL_HANDLE", "").strip()
+    expected_email = os.getenv("YOUTUBE_ACCOUNT_EMAIL", "").strip()
+    account_lines = ""
+    if expected_channel:
+        account_lines += f"📺 Canal: {_safe_html(expected_channel)}\n"
+    if expected_email:
+        account_lines += f"📧 Cuenta: {_safe_html(expected_email)}\n"
     text = (
         "📺 <b>CONECTAR YOUTUBE</b>\n\n"
-        "Reenvía este mensaje al cliente o pídele que haga esto:\n\n"
+        + (account_lines + "\n" if account_lines else "")
+        + "Reenvía este mensaje al cliente o pídele que haga esto:\n\n"
         f"1️⃣ Abre: {_safe_html(url)}\n"
         f"2️⃣ Escribe este código: <code>{_safe_html(code)}</code>\n"
         "3️⃣ Inicia sesión con la cuenta dueña del canal y acepta el permiso.\n"
+        "   Si el canal es una cuenta Brand, selecciónalo cuando Google lo pida.\n"
         "   Si Google muestra un aviso de app no verificada, entra en "
         "«Configuración avanzada» y continúa.\n\n"
         f"⏳ El código vence en {expires_min} minutos.\n"
@@ -2800,9 +2809,16 @@ async def cmd_connect_tiktok(client: Client, message: Message):
             "La app solo tiene permiso de perfil; no podrá publicar videos."
         )
 
+    expected_tiktok = os.getenv("TIKTOK_USERNAME", "").strip()
+    account_line = (
+        f"🎵 Cuenta: {_safe_html(expected_tiktok)}\n\n"
+        if expected_tiktok
+        else ""
+    )
     caption = (
         "🎵 <b>CONECTAR TIKTOK</b>\n\n"
-        "Reenvía este código QR al cliente o pídele que haga esto:\n\n"
+        + account_line
+        + "Reenvía este código QR al cliente o pídele que haga esto:\n\n"
         "1️⃣ Abre TikTok en el teléfono.\n"
         "2️⃣ Toca el ícono de escanear QR.\n"
         "3️⃣ Escanea este código y acepta el permiso.\n\n"
@@ -2851,6 +2867,8 @@ async def cmd_social_status(client: Client, message: Message):
 
     yt = status.get("youtube", {})
     tt = status.get("tiktok", {})
+    expected_yt = os.getenv("YOUTUBE_CHANNEL_HANDLE", "").strip()
+    expected_tt = os.getenv("TIKTOK_USERNAME", "").strip()
     lines = ["📡 <b>ESTADO DE REDES SOCIALES</b>", ""]
 
     if yt.get("connected"):
@@ -2861,6 +2879,8 @@ async def cmd_social_status(client: Client, message: Message):
             lines.append(f"   ⚠️ {_safe_html(str(yt['error'])[:300])}")
     else:
         lines.append("📺 <b>YouTube:</b> ❌ No conectado")
+        if expected_yt:
+            lines.append(f"   Esperado: {_safe_html(expected_yt)}")
         lines.append("   Usa /conectar_youtube")
 
     lines.append("")
@@ -2882,6 +2902,8 @@ async def cmd_social_status(client: Client, message: Message):
             lines.append(f"   ⚠️ {_safe_html(str(tt['error'])[:300])}")
     else:
         lines.append("🎵 <b>TikTok:</b> ❌ No conectado")
+        if expected_tt:
+            lines.append(f"   Esperado: {_safe_html(expected_tt)}")
         lines.append("   Usa /conectar_tiktok")
 
     lines.append("")

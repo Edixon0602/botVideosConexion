@@ -153,6 +153,20 @@ Si la app está en modo **Sandbox**, agrega la cuenta de TikTok del cliente como
   máximo 4 GB y 10 minutos por API.
 - Si la app no está auditada, solo se permite privacidad `SELF_ONLY`.
 
+## Cuentas esperadas (opcional)
+
+Puedes definir en `.env` los datos de la cuenta que debe conectar el cliente.
+El bot los mostrará en `/conectar_youtube`, `/conectar_tiktok` y `/redes`:
+
+```env
+YOUTUBE_CHANNEL_HANDLE=@MiCanal
+YOUTUBE_ACCOUNT_EMAIL=cuenta@gmail.com
+TIKTOK_USERNAME=@MiUsuario
+```
+
+Estos valores no se guardan en el repositorio; van solo en el `.env` del
+servidor.
+
 ## 4. Comandos de Telegram
 
 Solo para administradores:
