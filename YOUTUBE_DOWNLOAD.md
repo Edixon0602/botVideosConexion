@@ -151,7 +151,8 @@ Luego envía un enlace de YouTube al bot. En los logs deberías ver algo como:
 [YouTube] Descarga exitosa (con cookies): ...
 ```
 
-Si ves `Sign in to confirm`, actualiza `cookies.txt` o configura
+Si ves `Sign in to confirm`, reinicia Tor para cambiar de nodo
+(`sudo systemctl restart tor`), actualiza `cookies.txt` o configura
 `YOUTUBE_PROXY`. Si ves `JavaScript runtime`, reconstruye la imagen.
 
 ## Notas

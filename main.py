@@ -611,8 +611,8 @@ def download_youtube_video(url: str, output_dir: str = "downloads") -> tuple[boo
     ):
         friendly = (
             "YouTube bloqueó la descarga desde el servidor. "
-            "Actualiza cookies.txt con cookies frescas de YouTube o configura "
-            "YOUTUBE_PROXY con un proxy residencial. "
+            "Si estás usando Tor, reinicia el servicio para cambiar de nodo. "
+            "Si no, actualiza cookies.txt o configura YOUTUBE_PROXY. "
             f"Detalle: {detail}"
         )
     elif (
