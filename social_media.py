@@ -1123,7 +1123,18 @@ def _tiktok_upload_file(upload_url, local_path, size, chunk_size, total_chunks,
         for index in range(total_chunks):
             start = index * chunk_size
             f.seek(start)
-            chunk = f.read(chunk_size)
+            if index == total_chunks - 1:
+                # El último chunk debe absorber todo el resto del archivo.
+                # Si se lee solo chunk_size, se pierden los bytes finales y
+                # TikTok responde HTTP 416 (Content-Range incompleto).
+                chunk = f.read(size - start)
+            else:
+                chunk = f.read(chunk_size)
+            if not chunk:
+                raise SocialPublishError(
+                    f"TikTok: el chunk {index + 1} quedó vacío. "
+                    "El archivo cambió durante la subida."
+                )
             end = start + len(chunk) - 1
             req = urllib.request.Request(
                 upload_url,
