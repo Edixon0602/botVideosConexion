@@ -64,6 +64,9 @@ FTP_PASS = os.getenv("FTP_PASS")
 # pero podemos dejarlo para retrocompatibilidad
 FTP_UPLOAD_PATH = os.getenv("FTP_UPLOAD_PATH")
 
+VDOPANEL_HOST = os.getenv("VDOPANEL_HOST", os.getenv("FTP_HOST", "stream.conexion.com.ve"))
+VDOPANEL_BASE_URL = f"https://{VDOPANEL_HOST}"
+
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 NOTIFICATION_CHAT_ID = os.getenv("NOTIFICATION_CHAT_ID")
@@ -862,10 +865,10 @@ def publish_video_to_instagram(local_video_path: str, caption: str = "") -> tupl
         return True, ig["permalink"], "Publicado exitosamente en Instagram"
     return False, "", ig["error"]
 
-async def set_vdo_schedule_status(session: aiohttp.ClientSession, run_status: int = 1, sched_id: int = 17) -> bool:
+async def set_vdo_schedule_status(session: aiohttp.ClientSession, run_status: int = 1, sched_id: int = 2) -> bool:
     """Configura el estado del programador de la playlist (run_status: 1 = ON, 0 = OFF) en VDO Panel."""
     try:
-        sched_url = "https://stream.conexion.com.ve/broadcaster/scheduler"
+        sched_url = f"{VDOPANEL_BASE_URL}/broadcaster/scheduler"
         async with session.get(sched_url) as resp:
             if resp.status != 200:
                 return False
@@ -904,16 +907,16 @@ async def set_vdo_schedule_status(session: aiohttp.ClientSession, run_status: in
         headers = {
             'X-Requested-With': 'XMLHttpRequest',
             'Referer': sched_url,
-            'Origin': 'https://stream.conexion.com.ve'
+            'Origin': VDOPANEL_BASE_URL
         }
-        async with session.post("https://stream.conexion.com.ve/broadcaster/change-schedule-run-status", data=post_data, headers=headers) as resp:
+        async with session.post(f"{VDOPANEL_BASE_URL}/broadcaster/change-schedule-run-status", data=post_data, headers=headers) as resp:
             logger.info(f"Configuración de scheduler {sched_id} (run_status={run_status}): HTTP {resp.status}")
             return resp.status == 200
     except Exception as e:
         logger.error(f"Error configurando scheduler run status: {e}")
         return False
 
-async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int = 17) -> bool:
+async def activate_vdo_scheduler(session: aiohttp.ClientSession, sched_id: int = 2) -> bool:
     """Retrocompatibilidad: activa el programador continuo."""
     return await set_vdo_schedule_status(session, run_status=1, sched_id=sched_id)
 
@@ -937,10 +940,10 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
     elif "restart" in action_url.lower():
         action_type = "restart"
         
-    login_url = "https://stream.conexion.com.ve/broadcaster/login"
-    ajax_url = "https://stream.conexion.com.ve/broadcaster/ajax-get-current-running"
+    login_url = f"{VDOPANEL_BASE_URL}/broadcaster/login"
+    ajax_url = f"{VDOPANEL_BASE_URL}/broadcaster/ajax-get-current-running"
     headers_common = {
-        "Referer": "https://stream.conexion.com.ve/broadcaster",
+        "Referer": f"{VDOPANEL_BASE_URL}/broadcaster",
         "User-Agent": "Mozilla/5.0"
     }
     
@@ -965,21 +968,21 @@ async def control_vdo_panel(action_url: str) -> tuple[bool, str]:
                 logger.info("[VDO Control] 1/3 Desactivando estado de programación (run_status = 0)...")
                 await set_vdo_schedule_status(session, run_status=0)
                 logger.info("[VDO Control] 2/3 Deteniendo WebTV scheduler...")
-                async with session.get("https://stream.conexion.com.ve/broadcaster/stop-webtv", headers=headers_common) as r:
+                async with session.get(f"{VDOPANEL_BASE_URL}/broadcaster/stop-webtv", headers=headers_common) as r:
                     logger.info(f"[VDO Control] stop-webtv: HTTP {r.status}")
                 logger.info("[VDO Control] 3/3 Deteniendo servicio RTMP...")
-                async with session.get("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm", headers=headers_common) as r:
+                async with session.get(f"{VDOPANEL_BASE_URL}/broadcaster/stop-serv-confirm", headers=headers_common) as r:
                     logger.info(f"[VDO Control] stop-serv-confirm: HTTP {r.status}")
 
             async def do_start():
                 logger.info("[VDO Control] 1/3 Activando estado de programación (run_status = 1)...")
                 await set_vdo_schedule_status(session, run_status=1)
                 logger.info("[VDO Control] 2/3 Iniciando servicio RTMP...")
-                async with session.get("https://stream.conexion.com.ve/broadcaster/start-serv-confirm", headers=headers_common) as r:
+                async with session.get(f"{VDOPANEL_BASE_URL}/broadcaster/start-serv-confirm", headers=headers_common) as r:
                     logger.info(f"[VDO Control] start-serv-confirm: HTTP {r.status}")
                 await asyncio.sleep(2)
                 logger.info("[VDO Control] 3/3 Iniciando WebTV scheduler...")
-                async with session.get("https://stream.conexion.com.ve/broadcaster/start-webtv", headers=headers_common) as r:
+                async with session.get(f"{VDOPANEL_BASE_URL}/broadcaster/start-webtv", headers=headers_common) as r:
                     logger.info(f"[VDO Control] start-webtv: HTTP {r.status}")
 
             # 3. Ejecución coordinada
@@ -1050,8 +1053,8 @@ async def get_vdo_stream_status() -> dict | None:
     if not vdo_user or not vdo_pass or vdo_user == "tu_usuario_panel_aqui":
         return None
         
-    login_url = "https://stream.conexion.com.ve/broadcaster/login"
-    ajax_url = "https://stream.conexion.com.ve/broadcaster/ajax-get-current-running"
+    login_url = f"{VDOPANEL_BASE_URL}/broadcaster/login"
+    ajax_url = f"{VDOPANEL_BASE_URL}/broadcaster/ajax-get-current-running"
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -1074,6 +1077,82 @@ async def get_vdo_stream_status() -> dict | None:
         logger.error(f"Error consultando estado del stream: {e}")
     return None
 
+async def resolve_vdo_playlist_id(session: aiohttp.ClientSession, preferred_id: int = None, hint: str = None) -> int:
+    """
+    Resuelve de forma robusta e inteligente el ID de la playlist musical en VDO Panel.
+    Evita fallos si el cliente migra de servidor o se reasignan IDs en la base de datos de VDO Panel.
+    """
+    playlists = {}
+    try:
+        playlist_url = f"{VDOPANEL_BASE_URL}/broadcaster/playlist"
+        async with session.get(playlist_url) as r:
+            if r.status == 200:
+                soup = BeautifulSoup(await r.text(), 'html.parser')
+                table = soup.find('table')
+                if table:
+                    for tr in table.find_all('tr'):
+                        tds = tr.find_all('td')
+                        if len(tds) >= 2:
+                            cell_text = tds[1].get_text(strip=True)
+                            m = re.search(r'^(.*?)\s*ID:\s*#(\d+)', cell_text, re.IGNORECASE)
+                            if m:
+                                pl_name = m.group(1).strip()
+                                pl_id = int(m.group(2))
+                                playlists[pl_id] = pl_name
+                            else:
+                                for a in tr.find_all('a', href=True):
+                                    m_link = re.search(r'/playlist/(\d+)/', a['href'])
+                                    if m_link:
+                                        playlists[int(m_link.group(1))] = cell_text
+                                        break
+    except Exception as e:
+        logger.warning(f"[VDO Panel] Advertencia extrayendo lista de playlists: {e}")
+
+    # 1. Si preferred_id o VDOPANEL_PLAYLIST_ID existe en el panel, usarlo
+    env_id = None
+    try:
+        env_val = os.getenv("VDOPANEL_PLAYLIST_ID")
+        if env_val:
+            env_id = int(env_val)
+    except Exception:
+        pass
+
+    cand_id = preferred_id if preferred_id is not None else env_id
+    if cand_id and cand_id in playlists:
+        logger.info(f"[VDO Panel] Playlist ID {cand_id} confirmada en el panel ('{playlists[cand_id]}').")
+        return cand_id
+
+    # 2. Si el ID configurado no existe (ej. ID 12 tras migración), buscar por nombre
+    search_terms = [t for t in [hint, os.getenv("VDOPANEL_PLAYLIST_NAME"), "MUSICANEW", "MUSICA"] if t]
+    for term in search_terms:
+        term_clean = term.strip().lower()
+        for pid, pname in playlists.items():
+            if term_clean in pname.lower():
+                logger.info(f"[VDO Panel] Playlist resuelta dinámicamente por término '{term}': ID {pid} ('{pname}').")
+                return pid
+
+    # 3. Consultar la playlist activa en el reproductor / scheduler actual
+    try:
+        ajax_url = f"{VDOPANEL_BASE_URL}/broadcaster/ajax-get-current-running"
+        async with session.get(ajax_url, headers={"X-Requested-With": "XMLHttpRequest", "User-Agent": "Mozilla/5.0"}) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                active_id = data.get("options", {}).get("ched_id")
+                if active_id and int(active_id) in playlists:
+                    logger.info(f"[VDO Panel] Playlist resuelta desde stream en vivo: ID {active_id} ('{playlists[int(active_id)]}').")
+                    return int(active_id)
+    except Exception:
+        pass
+
+    # 4. Fallback al primer ID existente o a 2
+    if playlists:
+        fallback_id = list(playlists.keys())[0]
+        logger.warning(f"[VDO Panel] Usando fallback a primera playlist encontrada: ID {fallback_id}")
+        return fallback_id
+
+    return cand_id or 2
+
+
 async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None, copies: int = 10) -> tuple[bool, int]:
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
@@ -1088,11 +1167,11 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
         logger.error("Credenciales de VDO Panel no configuradas.")
         return False, 0
         
-    login_url = "https://stream.conexion.com.ve/broadcaster/login"
+    login_url = f"{VDOPANEL_BASE_URL}/broadcaster/login"
     folder_clean = target_folder.strip("/") if target_folder else ""
-    fm_url = f"https://stream.conexion.com.ve/broadcaster/filemanager?p={folder_clean}"
-    batch_url = "https://stream.conexion.com.ve/broadcaster/filemanager/batch"
-    add_url = "https://stream.conexion.com.ve/broadcaster/addtoplaylistpost"
+    fm_url = f"{VDOPANEL_BASE_URL}/broadcaster/filemanager?p={folder_clean}"
+    batch_url = f"{VDOPANEL_BASE_URL}/broadcaster/filemanager/batch"
+    add_url = f"{VDOPANEL_BASE_URL}/broadcaster/addtoplaylistpost"
     
     name, ext = os.path.splitext(file_name)
     
@@ -1119,7 +1198,11 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                     logger.error(f"Fallo al loguear en VDO Panel: {resp.status} - {resp.url}")
                     return False, 0
                     
-            # 2. GET filemanager para obtener el token CSRF y los archivos reales del servidor
+            # 2. Resolver dinámicamente el ID de la playlist (protege contra migraciones de servidor)
+            playlist_id = await resolve_vdo_playlist_id(session, preferred_id=playlist_id)
+            logger.info(f"[VDO Panel] Playlist objetivo seleccionada: ID {playlist_id}")
+
+            # 3. GET filemanager para obtener el token CSRF y los archivos reales del servidor
             fm_token = None
             existing_fm_files = set()
             async with session.get(fm_url) as resp:
@@ -1195,7 +1278,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                 
             headers_step1 = {
                 "Referer": fm_url,
-                "Origin": "https://stream.conexion.com.ve",
+                "Origin": VDOPANEL_BASE_URL,
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             
@@ -1228,7 +1311,7 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             
             headers_step2 = {
                 "Referer": batch_url,
-                "Origin": "https://stream.conexion.com.ve",
+                "Origin": VDOPANEL_BASE_URL,
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             
@@ -1287,7 +1370,7 @@ async def cmd_start_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **INICIAR** el stream en VDO Panel y sincronizar la programación...")
-    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/start-serv-confirm")
+    success, res_text = await control_vdo_panel(f"{VDOPANEL_BASE_URL}/broadcaster/start-serv-confirm")
     await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("detener") & filters.private)
@@ -1302,7 +1385,7 @@ async def cmd_stop_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **DETENER** el stream en VDO Panel...")
-    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/stop-serv-confirm")
+    success, res_text = await control_vdo_panel(f"{VDOPANEL_BASE_URL}/broadcaster/stop-serv-confirm")
     await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("reiniciar") & filters.private)
@@ -1317,7 +1400,7 @@ async def cmd_restart_stream(client: Client, message: Message):
         return
         
     msg = await message.reply_text("⏳ Intentando **REINICIAR** el stream en VDO Panel y sincronizar la programación...")
-    success, res_text = await control_vdo_panel("https://stream.conexion.com.ve/broadcaster/restart-serv-confirm")
+    success, res_text = await control_vdo_panel(f"{VDOPANEL_BASE_URL}/broadcaster/restart-serv-confirm")
     await msg.edit_text(res_text)
 
 @app.on_message(filters.incoming & ~filters.me & filters.command("estado") & filters.private)
