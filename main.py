@@ -1338,7 +1338,9 @@ async def start(client: Client, message: Message):
         admin_extra = ""
         if is_admin(user_id):
             admin_extra = (
-                "\n\n🔗 **Redes Sociales (solo admin):**\n"
+                "\n\n👑 **Administración:**\n"
+                "🧪 `/testadmin` - Probar envío de notificaciones a todos los admins\n"
+                "\n🔗 **Redes Sociales (solo admin):**\n"
                 "📺 `/conectar_youtube` - Vincular el canal de YouTube\n"
                 "🎵 `/conectar_tiktok` - Vincular la cuenta de TikTok\n"
                 "📡 `/redes` - Ver el estado de las cuentas"
@@ -1432,6 +1434,43 @@ async def cmd_status_stream(client: Client, message: Message):
         await msg.edit_text(text)
     else:
         await msg.edit_text("❌ No se pudo obtener el estado de VDO Panel. Revisa las credenciales o conexión.")
+
+@app.on_message(filters.incoming & ~filters.me & filters.command(["testadmin", "probar_admins", "admins"]) & filters.private)
+async def cmd_test_admin(client: Client, message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.reply_text("❌ Solo los administradores pueden ejecutar este comando.")
+        return
+
+    status_msg = await message.reply_text("🔍 Verificando lista de administradores y probando envío de notificaciones...")
+    
+    results = []
+    results.append("📋 **Lista de Administradores Configurados:**")
+    results.append(f"• Total en memoria: `{len(ADMIN_CHAT_IDS)}` admins")
+    results.append(f"• IDs: `{', '.join(str(cid) for cid in ADMIN_CHAT_IDS)}`\n")
+    results.append("📤 **Prueba de Envío:**")
+
+    for admin_id in ADMIN_CHAT_IDS:
+        try:
+            await client.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"🔔 **Prueba de Notificación de Administrador**\n\n"
+                    f"¡Hola! Tu ID `{admin_id}` está correctamente configurado como administrador del bot.\n"
+                    f"Las notificaciones de videos subidos se entregarán aquí sin problemas."
+                )
+            )
+            results.append(f"✅ ID `{admin_id}`: **Notificación entregada con éxito.**")
+        except Exception as e:
+            err_str = str(e)
+            if any(term in err_str for term in ["PEER_ID_INVALID", "USER_NOT_MUTUAL_CONTACT", "CHAT_NOT_FOUND"]):
+                hint = "⚠️ El usuario DEBE entrar al bot y presionar /start primero para autorizar mensajes."
+            elif any(term in err_str for term in ["USER_IS_BLOCKED", "BOT_BLOCKED"]):
+                hint = "⚠️ El usuario tiene bloqueado al bot."
+            else:
+                hint = f"⚠️ Error: `{err_str}`"
+            results.append(f"❌ ID `{admin_id}`: Falló el envío.\n   └ {hint}")
+
+    await status_msg.edit_text("\n".join(results))
 
 async def edit_message_or_caption(message: Message, new_text: str, reply_markup=None):
     try:
