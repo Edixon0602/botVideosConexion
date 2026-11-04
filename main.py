@@ -1678,9 +1678,9 @@ async def send_youtube_panel(client: Client, source_message: Message, file_id: s
         [InlineKeyboardButton("✅ Publicar en YouTube", callback_data=f"yt_go_{file_id}")],
         [InlineKeyboardButton("✏️ Editar texto", callback_data=f"yt_edit_{file_id}")],
         [
-            InlineKeyboardButton("🌍 Público", callback_data=f"yt_priv_{file_id}_public"),
-            InlineKeyboardButton("🔗 No listado", callback_data=f"yt_priv_{file_id}_unlisted"),
-            InlineKeyboardButton("🔒 Privado", callback_data=f"yt_priv_{file_id}_private"),
+            InlineKeyboardButton(f"{'✅ ' if privacy == 'public' else ''}🌍 Público", callback_data=f"yt_priv_{file_id}_public"),
+            InlineKeyboardButton(f"{'✅ ' if privacy == 'unlisted' else ''}🔗 No listado", callback_data=f"yt_priv_{file_id}_unlisted"),
+            InlineKeyboardButton(f"{'✅ ' if privacy == 'private' else ''}🔒 Privado", callback_data=f"yt_priv_{file_id}_private"),
         ],
         [InlineKeyboardButton("❌ Cancelar", callback_data=f"yt_cancel_{file_id}")],
     ])
@@ -1804,9 +1804,12 @@ async def send_tiktok_panel(client: Client, source_message: Message, file_id: st
     if mode == "direct" and options:
         privacy_row = []
         for option in options:
+            lbl = _tiktok_privacy_label(option)
+            if option == privacy:
+                lbl = f"✅ {lbl}"
             privacy_row.append(
                 InlineKeyboardButton(
-                    _tiktok_privacy_label(option),
+                    lbl,
                     callback_data=f"tt_priv_{file_id}_{option}",
                 )
             )
@@ -2320,6 +2323,23 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
         await callback_query.answer("⏳ Agregando video a la Lista Musical...", show_alert=False)
     else:
         await callback_query.answer("⏳ Agregando las 10 copias a la Lista Musical...", show_alert=False)
+
+    # Feedback visual inmediato en el botón
+    current_markup = callback_query.message.reply_markup
+    wait_rows = []
+    if current_markup and current_markup.inline_keyboard:
+        for row in current_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                if btn.callback_data and btn.callback_data.startswith("addpl_"):
+                    new_row.append(InlineKeyboardButton("⏳ Agregando...", callback_data=f"noop_{file_id}"))
+                else:
+                    new_row.append(btn)
+            wait_rows.append(new_row)
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(wait_rows))
+        except Exception:
+            pass
     
     success, count = await add_files_to_vdo_playlist(target_folder, file_name, copies=copies)
     
@@ -2605,7 +2625,35 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     current_content = callback_query.message.caption or callback_query.message.text or ""
     
     if action == "cust":
-        admin_states[admin_id] = {"action": "awaiting_custom_date", "file_id": file_id}
+        admin_states[admin_id] = {
+            "action": "awaiting_custom_date",
+            "file_id": file_id,
+            "video_message": callback_query.message
+        }
+        # Marcar visualmente el botón Personalizada en el mensaje
+        current_markup = callback_query.message.reply_markup
+        cust_rows = []
+        if current_markup and current_markup.inline_keyboard:
+            for row in current_markup.inline_keyboard:
+                new_row = []
+                for btn in row:
+                    cb = btn.callback_data or ""
+                    if cb.startswith("exp_"):
+                        parts = cb.split("_", 2)
+                        btn_act = parts[1] if len(parts) >= 2 else ""
+                        clean_text = btn.text.replace("✅ ", "").replace("✍️ ", "").strip()
+                        if btn_act == "cust":
+                            new_row.append(InlineKeyboardButton(f"✍️ {clean_text}...", callback_data=cb))
+                        else:
+                            new_row.append(InlineKeyboardButton(clean_text, callback_data=cb))
+                    else:
+                        new_row.append(btn)
+                cust_rows.append(new_row)
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(cust_rows))
+            except Exception:
+                pass
+
         await edit_message_or_caption(
             callback_query.message,
             current_content + "\n\n✍️ **Por favor, escribe en el chat la cantidad de días** que debe durar el archivo (ej: `15`) o una fecha en formato `YYYY-MM-DD`."
@@ -2633,16 +2681,17 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
         
     delete_timestamp = time.time() + seconds
     deletions[file_id]["delete_after"] = delete_timestamp
+    deletions[file_id]["expiration_selected"] = action
     save_deletions(deletions)
     
     date_str = format_caracas_time(delete_timestamp)
     
     is_added = deletions[file_id].get("playlist_added", False)
-    pl_label = "✅ Agregado a Lista Musical" if is_added else "🎵 Agregar a Lista Musical"
+    pl_label = "✅ Agregado a la Lista" if is_added else "🎵 Agregar a Lista Musical"
     pl_callback = f"noop_{file_id}" if is_added else f"addpl_{file_id}"
     pl_btn = InlineKeyboardButton(pl_label, callback_data=pl_callback)
 
-    # Conservar los botones de YouTube, TikTok, IG/FB y autodestrucción.
+    # Actualizar botones conservando YouTube, TikTok, Redes y marcando con ✅ el botón de expiración seleccionado
     current_markup = callback_query.message.reply_markup
     new_rows = []
     playlist_found = False
@@ -2658,6 +2707,14 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
                 if is_playlist_btn:
                     new_row.append(pl_btn)
                     playlist_found = True
+                elif cb.startswith("exp_"):
+                    parts = cb.split("_", 2)
+                    btn_act = parts[1] if len(parts) >= 2 else ""
+                    clean_text = btn.text.replace("✅ ", "").replace("✍️ ", "").strip()
+                    if btn_act == action:
+                        new_row.append(InlineKeyboardButton(f"✅ {clean_text}", callback_data=cb))
+                    else:
+                        new_row.append(InlineKeyboardButton(clean_text, callback_data=cb))
                 else:
                     new_row.append(btn)
             new_rows.append(new_row)
@@ -2669,7 +2726,7 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
         current_content + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
         reply_markup=InlineKeyboardMarkup(new_rows)
     )
-    await callback_query.answer("Programado exitosamente.")
+    await callback_query.answer(f"✅ Configurado: {text_confirm}")
 
 # ==========================================
 # CONEXIÓN DE CUENTAS DE YOUTUBE Y TIKTOK
@@ -3113,6 +3170,7 @@ async def handle_youtube_go_callback(client: Client, callback_query: CallbackQue
     state = admin_states.pop(admin_id, {})
     video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
     await callback_query.answer("🚀 Subiendo a YouTube...")
+    await _update_video_button(video_msg, ("yt_pub_", "noop_yt_"), "⏳ YouTube...", f"noop_yt_{file_id}")
     await execute_youtube_publish(
         client, video_msg, file_id, status_message=callback_query.message
     )
@@ -3128,6 +3186,7 @@ async def handle_tiktok_go_callback(client: Client, callback_query: CallbackQuer
     state = admin_states.pop(admin_id, {})
     video_msg = state.get("video_message") or callback_query.message.reply_to_message or callback_query.message
     await callback_query.answer("🚀 Enviando a TikTok...")
+    await _update_video_button(video_msg, ("tt_pub_", "noop_tt_"), "⏳ TikTok...", f"noop_tt_{file_id}")
     await execute_tiktok_publish(
         client, video_msg, file_id, status_message=callback_query.message
     )
@@ -3396,10 +3455,35 @@ async def handle_admin_text(client: Client, message: Message):
             return
             
         deletions[file_id]["delete_after"] = delete_timestamp
+        deletions[file_id]["expiration_selected"] = "cust"
         save_deletions(deletions)
-        del admin_states[admin_id]
-        
         date_str = format_caracas_time(delete_timestamp)
+
+        # Actualizar botón Personalizada con checkmark en el mensaje del video
+        video_msg = admin_states[admin_id].get("video_message")
+        if video_msg and getattr(video_msg, "reply_markup", None):
+            try:
+                v_rows = []
+                for row in video_msg.reply_markup.inline_keyboard:
+                    n_row = []
+                    for btn in row:
+                        cb = btn.callback_data or ""
+                        if cb.startswith("exp_"):
+                            parts = cb.split("_", 2)
+                            btn_act = parts[1] if len(parts) >= 2 else ""
+                            clean_text = btn.text.replace("✅ ", "").replace("✍️ ", "").strip()
+                            if btn_act == "cust":
+                                n_row.append(InlineKeyboardButton(f"✅ Personalizada ({text})", callback_data=cb))
+                            else:
+                                n_row.append(InlineKeyboardButton(clean_text, callback_data=cb))
+                        else:
+                            n_row.append(btn)
+                    v_rows.append(n_row)
+                await video_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(v_rows))
+            except Exception as e_vmsg:
+                logger.warning(f"No se pudo actualizar botón en video_msg: {e_vmsg}")
+
+        del admin_states[admin_id]
         await message.reply_text(f"✅ **Autodestrucción programada:**\nEl archivo se eliminará el {date_str} (Hora Vzla).")
         return
 
