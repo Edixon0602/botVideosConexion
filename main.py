@@ -129,26 +129,73 @@ def save_users(users):
         json.dump(users, f)
 
 DELETIONS_FILE = 'deletions.json'
-deletions_lock = threading.Lock()
+deletions_lock = threading.RLock()
 admin_states = {}
 youtube_connect_state = {"active": False, "started_at": 0, "flow_id": 0, "task": None}
 tiktok_connect_state = {"active": False, "started_at": 0, "flow_id": 0, "task": None}
 social_publish_in_progress = set()
 
+def _load_deletions_unlocked():
+    if not os.path.exists(DELETIONS_FILE):
+        return {}
+    try:
+        with open(DELETIONS_FILE, 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error(f"Error leyendo {DELETIONS_FILE}: {e}")
+        raise
+
+def _save_deletions_unlocked(data):
+    payload = json.dumps(data)
+    with open(DELETIONS_FILE, 'w', encoding='utf-8') as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
 def load_deletions():
     with deletions_lock:
-        if not os.path.exists(DELETIONS_FILE):
-            return {}
         try:
-            with open(DELETIONS_FILE, 'r') as f:
-                return json.load(f)
-        except:
+            return _load_deletions_unlocked()
+        except Exception:
             return {}
 
 def save_deletions(data):
     with deletions_lock:
-        with open(DELETIONS_FILE, 'w') as f:
-            json.dump(data, f)
+        _save_deletions_unlocked(data)
+
+def get_deletion_entry(file_id: str):
+    with deletions_lock:
+        data = _load_deletions_unlocked()
+        entry = data.get(file_id)
+        return dict(entry) if isinstance(entry, dict) else None
+
+def set_deletion_entry(file_id: str, entry: dict):
+    with deletions_lock:
+        data = _load_deletions_unlocked()
+        data[file_id] = entry
+        _save_deletions_unlocked(data)
+
+def update_deletion_entry(file_id: str, updates: dict) -> bool:
+    with deletions_lock:
+        data = _load_deletions_unlocked()
+        if file_id not in data or not isinstance(data[file_id], dict):
+            return False
+        data[file_id].update(updates)
+        _save_deletions_unlocked(data)
+        return True
+
+def delete_deletion_entry(file_id: str) -> bool:
+    with deletions_lock:
+        data = _load_deletions_unlocked()
+        if file_id not in data:
+            return False
+        del data[file_id]
+        _save_deletions_unlocked(data)
+        return True
 
 # Inicializar cliente de Pyrogram
 app = Client(
@@ -1928,16 +1975,16 @@ async def execute_youtube_publish(client: Client, video_message: Message, file_i
             dry_run,
         )
 
-        deletions = load_deletions()
-        if file_id in deletions:
-            deletions[file_id]["youtube_caption"] = caption
-            deletions[file_id]["youtube_privacy"] = result.get("privacy", privacy)
-            deletions[file_id]["youtube_dry_run"] = bool(result.get("dry_run"))
-            if not result.get("dry_run"):
-                deletions[file_id]["youtube_url"] = result.get("url", "")
-                deletions[file_id]["youtube_video_id"] = result.get("video_id", "")
-                deletions[file_id]["youtube_published_at"] = int(time.time())
-            save_deletions(deletions)
+        yt_updates = {
+            "youtube_caption": caption,
+            "youtube_privacy": result.get("privacy", privacy),
+            "youtube_dry_run": bool(result.get("dry_run")),
+        }
+        if not result.get("dry_run"):
+            yt_updates["youtube_url"] = result.get("url", "")
+            yt_updates["youtube_video_id"] = result.get("video_id", "")
+            yt_updates["youtube_published_at"] = int(time.time())
+        update_deletion_entry(file_id, yt_updates)
 
         if result.get("dry_run"):
             # Se deja el botón activo para poder publicar de verdad luego.
@@ -2055,18 +2102,18 @@ async def execute_tiktok_publish(client: Client, video_message: Message, file_id
         )
 
         result_mode = result.get("mode", mode)
-        deletions = load_deletions()
-        if file_id in deletions:
-            deletions[file_id]["tiktok_caption"] = caption
-            deletions[file_id]["tiktok_dry_run"] = bool(result.get("dry_run"))
-            deletions[file_id]["tiktok_pending"] = bool(result.get("pending"))
-            deletions[file_id]["tiktok_mode"] = result_mode
-            deletions[file_id]["tiktok_privacy"] = result.get("privacy", privacy)
-            if not result.get("dry_run"):
-                deletions[file_id]["tiktok_publish_id"] = result.get("publish_id", "")
-                deletions[file_id]["tiktok_url"] = result.get("url", "")
-                deletions[file_id]["tiktok_published_at"] = int(time.time())
-            save_deletions(deletions)
+        tt_updates = {
+            "tiktok_caption": caption,
+            "tiktok_dry_run": bool(result.get("dry_run")),
+            "tiktok_pending": bool(result.get("pending")),
+            "tiktok_mode": result_mode,
+            "tiktok_privacy": result.get("privacy", privacy),
+        }
+        if not result.get("dry_run"):
+            tt_updates["tiktok_publish_id"] = result.get("publish_id", "")
+            tt_updates["tiktok_url"] = result.get("url", "")
+            tt_updates["tiktok_published_at"] = int(time.time())
+        update_deletion_entry(file_id, tt_updates)
 
         if result.get("dry_run"):
             # Se deja el botón activo para poder publicar de verdad luego.
@@ -2263,16 +2310,14 @@ async def handle_video(client: Client, message: Message):
             tg_media = message.video or message.document
             tg_file_id = tg_media.file_id if tg_media else None
 
-            deletions = load_deletions()
-            deletions[file_id] = {
+            set_deletion_entry(file_id, {
                 "ftp_path": target_folder,
                 "file_name": file_name,
                 "delete_after": None,
                 "caption": message.caption or "",
                 "telegram_file_id": tg_file_id,
                 "dropbox_audio_path": dropbox_audio_path
-            }
-            save_deletions(deletions)
+            })
             
             keyboard = InlineKeyboardMarkup([
                 [
@@ -2344,12 +2389,10 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     data = callback_query.data
     _, file_id = data.split("_", 1)
     
-    deletions = load_deletions()
-    if file_id not in deletions:
+    info = get_deletion_entry(file_id)
+    if not info:
         await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
         return
-        
-    info = deletions[file_id]
     target_folder = info.get("ftp_path", "")
     file_name = info.get("file_name", "")
     
@@ -2383,8 +2426,7 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     success, count = await add_files_to_vdo_playlist(target_folder, file_name, copies=copies)
     
     if success:
-        deletions[file_id]["playlist_added"] = True
-        save_deletions(deletions)
+        update_deletion_entry(file_id, {"playlist_added": True})
         
         btn_label = "✅ Agregado a la Lista" if copies == 1 else f"✅ Agregado ({count}/10)"
         current_markup = callback_query.message.reply_markup
@@ -2655,8 +2697,8 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     data = callback_query.data
     _, action, file_id = data.split("_", 2)
     
-    deletions = load_deletions()
-    if file_id not in deletions:
+    info = get_deletion_entry(file_id)
+    if not info:
         await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
         return
         
@@ -2719,13 +2761,17 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
         text_confirm = "1 Semana"
         
     delete_timestamp = time.time() + seconds
-    deletions[file_id]["delete_after"] = delete_timestamp
-    deletions[file_id]["expiration_selected"] = action
-    save_deletions(deletions)
+    if not update_deletion_entry(file_id, {
+        "delete_after": delete_timestamp,
+        "expiration_selected": action,
+    }):
+        await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
+        return
     
     date_str = format_caracas_time(delete_timestamp)
     
-    is_added = deletions[file_id].get("playlist_added", False)
+    fresh_info = get_deletion_entry(file_id) or info
+    is_added = fresh_info.get("playlist_added", False)
     pl_label = "✅ Agregado a la Lista" if is_added else "🎵 Agregar a Lista Musical"
     pl_callback = f"noop_{file_id}" if is_added else f"addpl_{file_id}"
     pl_btn = InlineKeyboardButton(pl_label, callback_data=pl_callback)
@@ -3291,12 +3337,9 @@ async def handle_youtube_privacy_callback(client: Client, callback_query: Callba
     if privacy not in ("public", "unlisted", "private"):
         await callback_query.answer("Privacidad inválida.", show_alert=True)
         return
-    deletions = load_deletions()
-    if file_id not in deletions:
+    if not update_deletion_entry(file_id, {"youtube_privacy": privacy}):
         await callback_query.answer("El video ya no está en el registro.", show_alert=True)
         return
-    deletions[file_id]["youtube_privacy"] = privacy
-    save_deletions(deletions)
     state = admin_states.get(admin_id, {})
     video_msg = state.get("video_message")
     await send_youtube_panel(
@@ -3321,12 +3364,9 @@ async def handle_tiktok_privacy_callback(client: Client, callback_query: Callbac
     if privacy not in social_media.TIKTOK_PRIVACY_LABELS:
         await callback_query.answer("Privacidad inválida.", show_alert=True)
         return
-    deletions = load_deletions()
-    if file_id not in deletions:
+    if not update_deletion_entry(file_id, {"tiktok_privacy": privacy}):
         await callback_query.answer("El video ya no está en el registro.", show_alert=True)
         return
-    deletions[file_id]["tiktok_privacy"] = privacy
-    save_deletions(deletions)
     state = admin_states.get(admin_id, {})
     video_msg = state.get("video_message")
     await send_tiktok_panel(
@@ -3417,10 +3457,7 @@ async def handle_admin_text(client: Client, message: Message):
         new_caption = message.text.strip()
 
         # Actualizar caption en deletions para persistencia
-        deletions = load_deletions()
-        if file_id in deletions:
-            deletions[file_id]["caption"] = new_caption
-            save_deletions(deletions)
+        update_deletion_entry(file_id, {"caption": new_caption})
 
         await message.reply_text(f"📝 **Nuevo caption guardado:**\n_{new_caption}_\n\n🚀 Iniciando subida a Redes (IG + FB)...")
         await execute_meta_publish(client, video_msg, file_id, new_caption)
@@ -3431,10 +3468,7 @@ async def handle_admin_text(client: Client, message: Message):
         file_id = state["file_id"]
         video_msg = state.get("video_message")
         new_caption = (message.text or "").strip()
-        deletions = load_deletions()
-        if file_id in deletions:
-            deletions[file_id]["youtube_caption"] = new_caption
-            save_deletions(deletions)
+        update_deletion_entry(file_id, {"youtube_caption": new_caption})
         panel_message = state.get("panel_message")
         if panel_message:
             try:
@@ -3451,10 +3485,7 @@ async def handle_admin_text(client: Client, message: Message):
         file_id = state["file_id"]
         video_msg = state.get("video_message")
         new_caption = (message.text or "").strip()[:2200]
-        deletions = load_deletions()
-        if file_id in deletions:
-            deletions[file_id]["tiktok_caption"] = new_caption
-            save_deletions(deletions)
+        update_deletion_entry(file_id, {"tiktok_caption": new_caption})
         panel_message = state.get("panel_message")
         if panel_message:
             try:
@@ -3470,8 +3501,7 @@ async def handle_admin_text(client: Client, message: Message):
         file_id = admin_states[admin_id]["file_id"]
         text = message.text.strip()
         
-        deletions = load_deletions()
-        if file_id not in deletions:
+        if not get_deletion_entry(file_id):
             await message.reply_text("❌ El archivo ya no está en el registro.")
             del admin_states[admin_id]
             return
@@ -3493,9 +3523,10 @@ async def handle_admin_text(client: Client, message: Message):
             await message.reply_text("❌ La fecha especificada ya pasó. Intenta con una fecha futura.")
             return
             
-        deletions[file_id]["delete_after"] = delete_timestamp
-        deletions[file_id]["expiration_selected"] = "cust"
-        save_deletions(deletions)
+        update_deletion_entry(file_id, {
+            "delete_after": delete_timestamp,
+            "expiration_selected": "cust",
+        })
         date_str = format_caracas_time(delete_timestamp)
 
         # Actualizar botón Personalizada con checkmark en el mensaje del video
@@ -3573,8 +3604,7 @@ async def handle_admin_text(client: Client, message: Message):
 
             # 3. Registrar en deletions.json para autodestrucción y acciones interactivas (sin Dropbox, 1 copia)
             file_id = str(uuid.uuid4())[:8]
-            deletions = load_deletions()
-            deletions[file_id] = {
+            set_deletion_entry(file_id, {
                 "ftp_path": target_folder,
                 "file_name": base_name,
                 "delete_after": None,
@@ -3582,8 +3612,7 @@ async def handle_admin_text(client: Client, message: Message):
                 "telegram_file_id": None,
                 "dropbox_audio_path": None,
                 "copies": 1
-            }
-            save_deletions(deletions)
+            })
 
             keyboard = InlineKeyboardMarkup([
                 [
@@ -3836,6 +3865,9 @@ def ftp_delete_file(target_folder, file_name):
         logger.error(f"Error borrando archivos FTP {file_name}: {e}")
         return False
 
+async def _send_admin_notification(chat_id: int, text: str):
+    await app.send_message(chat_id=chat_id, text=text)
+
 def auto_delete_worker():
     """Hilo que revisa cada minuto si algún archivo caducó"""
     while True:
@@ -3843,7 +3875,6 @@ def auto_delete_worker():
             time.sleep(60)
             deletions = load_deletions()
             now = time.time()
-            modified = False
             
             for file_id, info in list(deletions.items()):
                 delete_after = info.get("delete_after")
@@ -3856,6 +3887,7 @@ def auto_delete_worker():
                     
                     # Eliminar también el audio correspondiente en Dropbox (si no es YouTube)
                     dbx_deleted = False
+                    dbx_audio_path = None
                     if str(ftp_path).strip("/").lower() != "youtube":
                         dbx_audio_path = info.get("dropbox_audio_path")
                         if not dbx_audio_path:
@@ -3867,27 +3899,22 @@ def auto_delete_worker():
                         dbx_deleted = dropbox_delete_file(dbx_audio_path)
                     
                     if success or dbx_deleted:
+                        target_loop = getattr(app, "loop", None) or loop
                         for admin_chat_id in ADMIN_CHAT_IDS:
                             try:
                                 msg_text = f"🗑️ **Autodestrucción Ejecutada**\nEl archivo `{file_name}` ha sido eliminado del FTP."
-                                if dbx_deleted:
+                                if dbx_deleted and dbx_audio_path:
                                     msg_text += f"\n🎵 Audio `{os.path.basename(dbx_audio_path)}` eliminado de Dropbox."
-                                asyncio.run_coroutine_threadsafe(
-                                    app.send_message(
-                                        chat_id=admin_chat_id,
-                                        text=msg_text
-                                    ),
-                                    loop
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    _send_admin_notification(admin_chat_id, msg_text),
+                                    target_loop
                                 )
+                                fut.result(timeout=15)
                             except Exception as e:
                                 logger.error(f"Error enviando notif de borrado a admin {admin_chat_id}: {e}")
 
-                                
-                    del deletions[file_id]
-                    modified = True
-                    
-            if modified:
-                save_deletions(deletions)
+                    # Eliminar solo esta entrada releyendo bajo lock para no pisar altas recientes
+                    delete_deletion_entry(file_id)
         except Exception as e:
             logger.error(f"Error en auto_delete_worker: {e}")
 
