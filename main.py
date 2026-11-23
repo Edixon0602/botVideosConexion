@@ -197,9 +197,17 @@ def delete_deletion_entry(file_id: str) -> bool:
         _save_deletions_unlocked(data)
         return True
 
-# Inicializar cliente de Pyrogram
+# Inicializar cliente de Pyrogram (sesión persistente en data/ para sobrevivir reconstrucciones Docker)
+os.makedirs("data", exist_ok=True)
+SESSION_PATH = os.path.join("data", "mi_bot_videos")
+if os.path.exists("mi_bot_videos.session") and not os.path.exists(f"{SESSION_PATH}.session"):
+    try:
+        shutil.copy2("mi_bot_videos.session", f"{SESSION_PATH}.session")
+    except Exception as e:
+        logger.warning(f"No se pudo copiar sesión previa a {SESSION_PATH}.session: {e}")
+
 app = Client(
-    "mi_bot_videos",
+    SESSION_PATH,
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
