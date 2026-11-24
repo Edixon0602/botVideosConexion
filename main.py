@@ -2282,25 +2282,8 @@ async def handle_video(client: Client, message: Message):
         # 2. Subir por FTP en un hilo separado para no bloquear el event loop de Telegram
         await asyncio.to_thread(upload_to_ftp, local_path, file_name, target_folder)
         
-        # 3. Extraer audio y subir a Dropbox si está configurado
-        dropbox_uploaded = False
+        # 3. Eliminar archivo temporal local (Dropbox ahora se sube bajo demanda con botón)
         dropbox_audio_path = None
-        try:
-            base_name, _ = os.path.splitext(local_path)
-            audio_path = f"{base_name}.mp3"
-            if extract_audio_from_video(local_path, audio_path):
-                dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
-                dropbox_uploaded = await asyncio.to_thread(upload_audio_to_dropbox, audio_path, dropbox_folder)
-                if dropbox_uploaded:
-                    folder_clean = "/" + dropbox_folder.strip("/") if dropbox_folder.strip("/") else ""
-                    audio_filename = os.path.basename(audio_path)
-                    dropbox_audio_path = f"{folder_clean}/{audio_filename}"
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
-        except Exception as e_dbx:
-            logger.error(f"Error procesando audio para Dropbox: {e_dbx}")
-        
-        # 4. Eliminar archivo temporal local
         if os.path.exists(local_path):
             os.remove(local_path)
         
@@ -2334,11 +2317,12 @@ async def handle_video(client: Client, message: Message):
                 ],
                 [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
-                [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
-                [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
-                 InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
-                [InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}"),
-                 InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
+                [InlineKeyboardButton("🎧 Agregar a Dropbox", callback_data=f"dbx_add_{file_id}")],
+                [InlineKeyboardButton("12 Horas", callback_data=f"exp_12h_{file_id}"),
+                 InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}")],
+                [InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}"),
+                 InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}")],
+                [InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
             ])
             
             caption_text = (
@@ -2692,11 +2676,103 @@ async def handle_ig_cancel_callback(client: Client, callback_query: CallbackQuer
     await callback_query.answer("Operación cancelada.")
 
 
+@app.on_callback_query(filters.regex(r"^dbx_add_"))
+async def handle_dropbox_add_callback(client: Client, callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Solo administradores pueden subir a Dropbox.", show_alert=True)
+        return
+
+    _, _, file_id = callback_query.data.partition("dbx_add_")
+    info = get_deletion_entry(file_id)
+    if not info:
+        await callback_query.answer("Este archivo ya no está en el registro.", show_alert=True)
+        return
+
+    if info.get("dropbox_uploaded") or info.get("dropbox_audio_path"):
+        await _update_video_button(
+            callback_query.message,
+            ("dbx_add_", "noop_dbx_"),
+            "✅ Agregado a Dropbox",
+            f"noop_dbx_{file_id}",
+        )
+        await callback_query.answer("Este audio ya fue subido a Dropbox.", show_alert=True)
+        return
+
+    await callback_query.answer("⏳ Extrayendo audio y subiendo a Dropbox...", show_alert=False)
+    await _update_video_button(
+        callback_query.message,
+        ("dbx_add_", "noop_dbx_"),
+        "⏳ Subiendo a Dropbox...",
+        f"noop_dbx_{file_id}",
+    )
+
+    local_video_path = None
+    audio_path = None
+    try:
+        local_video_path, fresh_info = await resolve_publish_video(
+            client, callback_query.message, file_id
+        )
+        base_name, _ = os.path.splitext(local_video_path)
+        audio_path = f"{base_name}.mp3"
+
+        extracted = await asyncio.to_thread(
+            extract_audio_from_video, local_video_path, audio_path
+        )
+        if not extracted or not os.path.exists(audio_path):
+            raise Exception("No se pudo extraer el audio MP3 del video.")
+
+        dropbox_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA")
+        uploaded = await asyncio.to_thread(
+            upload_audio_to_dropbox, audio_path, dropbox_folder
+        )
+        if not uploaded:
+            raise Exception("Dropbox rechazó o falló la subida del audio.")
+
+        folder_clean = "/" + dropbox_folder.strip("/") if dropbox_folder.strip("/") else ""
+        dropbox_audio_path = f"{folder_clean}/{os.path.basename(audio_path)}"
+
+        update_deletion_entry(file_id, {
+            "dropbox_audio_path": dropbox_audio_path,
+            "dropbox_uploaded": True,
+        })
+
+        await _update_video_button(
+            callback_query.message,
+            ("dbx_add_", "noop_dbx_"),
+            "✅ Agregado a Dropbox",
+            f"noop_dbx_{file_id}",
+        )
+        await callback_query.message.reply_text(
+            f"✅ Audio subido a Dropbox: `{dropbox_audio_path}`"
+        )
+    except Exception as e:
+        logger.error(f"[Dropbox] Error subiendo audio bajo demanda ({file_id}): {e}")
+        await _update_video_button(
+            callback_query.message,
+            ("dbx_add_", "noop_dbx_"),
+            "🎧 Agregar a Dropbox",
+            f"dbx_add_{file_id}",
+        )
+        await callback_query.message.reply_text(
+            f"❌ No se pudo subir el audio a Dropbox:\n`{str(e)}`"
+        )
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+        _cleanup_temp_video(local_video_path)
+
+@app.on_callback_query(filters.regex(r"^noop_dbx_"))
+async def handle_noop_dbx_callback(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer("Este audio ya fue subido a Dropbox.", show_alert=True)
+
 @app.on_callback_query(filters.regex(r"^noop_ig_"))
 async def handle_noop_ig_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Este video ya fue procesado para las redes.", show_alert=True)
 
-@app.on_callback_query(filters.regex(r"^noop_(?!yt_|tt_|ig_)"))
+@app.on_callback_query(filters.regex(r"^noop_(?!yt_|tt_|ig_|dbx_)"))
 async def handle_noop_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Este archivo ya fue agregado a la lista musical.", show_alert=True)
 
@@ -2758,6 +2834,9 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     elif action == "5m":
         seconds = 300
         text_confirm = "5 Minutos"
+    elif action == "12h":
+        seconds = 43200
+        text_confirm = "12 Horas"
     elif action == "24h":
         seconds = 86400
         text_confirm = "24 Horas"
@@ -2795,7 +2874,7 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
                 cb = btn.callback_data or ""
                 is_playlist_btn = cb.startswith("addpl_") or (
                     cb.startswith("noop_")
-                    and not cb.startswith(("noop_yt_", "noop_tt_", "noop_ig_"))
+                    and not cb.startswith(("noop_yt_", "noop_tt_", "noop_ig_", "noop_dbx_"))
                 )
                 if is_playlist_btn:
                     new_row.append(pl_btn)
@@ -3629,11 +3708,12 @@ async def handle_admin_text(client: Client, message: Message):
                 ],
                 [InlineKeyboardButton("📲 Publicar en Redes (IG + FB)", callback_data=f"ig_pub_{file_id}")],
                 [InlineKeyboardButton("🎵 Agregar a Lista Musical", callback_data=f"addpl_{file_id}")],
-                [InlineKeyboardButton("2 Minutos (Test)", callback_data=f"exp_2m_{file_id}")],
-                [InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}"),
-                 InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}")],
-                [InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}"),
-                 InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
+                [InlineKeyboardButton("🎧 Agregar a Dropbox", callback_data=f"dbx_add_{file_id}")],
+                [InlineKeyboardButton("12 Horas", callback_data=f"exp_12h_{file_id}"),
+                 InlineKeyboardButton("24 Horas", callback_data=f"exp_24h_{file_id}")],
+                [InlineKeyboardButton("3 Días", callback_data=f"exp_3d_{file_id}"),
+                 InlineKeyboardButton("1 Semana", callback_data=f"exp_1w_{file_id}")],
+                [InlineKeyboardButton("Personalizada", callback_data=f"exp_cust_{file_id}")]
             ])
 
             user_first = message.from_user.first_name or "Admin"
@@ -3893,17 +3973,15 @@ def auto_delete_worker():
                     logger.info(f"Eliminando archivo caducado: {file_name} de {ftp_path}")
                     success = ftp_delete_file(ftp_path, file_name)
                     
-                    # Eliminar también el audio correspondiente en Dropbox (si no es YouTube)
+                    # Eliminar también el audio en Dropbox solo si fue subido a Dropbox
                     dbx_deleted = False
-                    dbx_audio_path = None
-                    if str(ftp_path).strip("/").lower() != "youtube":
-                        dbx_audio_path = info.get("dropbox_audio_path")
-                        if not dbx_audio_path:
-                            # Fallback: deducir ruta si no estaba explícita
-                            dbx_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA").strip("/")
-                            base_f, _ = os.path.splitext(file_name)
-                            dbx_audio_path = f"/{dbx_folder}/{base_f}.mp3"
-                        
+                    dbx_audio_path = info.get("dropbox_audio_path")
+                    if dbx_audio_path:
+                        dbx_deleted = dropbox_delete_file(dbx_audio_path)
+                    elif str(ftp_path).strip("/").lower() != "youtube" and info.get("dropbox_uploaded"):
+                        dbx_folder = os.getenv("DROPBOX_FOLDER", "/CNX-INFORMATIVA").strip("/")
+                        base_f, _ = os.path.splitext(file_name)
+                        dbx_audio_path = f"/{dbx_folder}/{base_f}.mp3"
                         dbx_deleted = dropbox_delete_file(dbx_audio_path)
                     
                     if success or dbx_deleted:
