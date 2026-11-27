@@ -280,6 +280,32 @@ def upload_to_ftp(local_file_path: str, remote_filename: str, target_folder: str
     ftp.quit()
     logger.info(f"Subida de {copies} copias al FTP completada.")
 
+def upload_extra_ftp_copies(local_file_path: str, remote_filename: str, target_folder: str, start_index: int = 10, count: int = 20):
+    """Sube copias adicionales numeradas al FTP a partir de start_index (ej. -10 a -29)."""
+    remote_filename = sanitize_filename(remote_filename)
+    logger.info(f"Conectando a FTP ({FTP_HOST}) para subir {count} copias extra desde -{start_index}...")
+    ftp = FTP(FTP_HOST)
+    ftp.login(user=FTP_USER, passwd=FTP_PASS)
+
+    if target_folder:
+        target_folder = target_folder.strip("/")
+        try:
+            ftp.cwd(target_folder)
+        except Exception:
+            ftp.mkd(target_folder)
+            ftp.cwd(target_folder)
+
+    name, ext = os.path.splitext(remote_filename)
+    for offset in range(count):
+        idx = start_index + offset
+        current_filename = f"{name}-{idx}{ext}"
+        logger.info(f"Subiendo copia extra {offset+1}/{count}: {current_filename}...")
+        with open(local_file_path, 'rb') as file:
+            ftp.storbinary(f'STOR {current_filename}', file)
+
+    ftp.quit()
+    logger.info(f"Subida de {count} copias extra al FTP completada.")
+
 def extract_audio_from_video(video_path: str, output_audio_path: str) -> bool:
     """Extrae el audio de un video en formato MP3 usando ffmpeg"""
     try:
@@ -1208,7 +1234,7 @@ async def resolve_vdo_playlist_id(session: aiohttp.ClientSession, preferred_id: 
     return cand_id or 2
 
 
-async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None, copies: int = 10) -> tuple[bool, int]:
+async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist_id: int = None, copies: int = 10, start_index: int = 0) -> tuple[bool, int]:
     vdo_user = os.getenv("VDOPANEL_USER")
     vdo_pass = os.getenv("VDOPANEL_PASS")
     
@@ -1286,7 +1312,9 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
             sanitized_name = sanitize_filename(file_name)
             s_name, s_ext = os.path.splitext(sanitized_name)
             
-            if copies <= 1:
+            if start_index > 0:
+                expected_copies = [f"{s_name}-{start_index + i}{s_ext}" for i in range(copies)]
+            elif copies <= 1:
                 expected_copies = [s_name + s_ext]
             else:
                 expected_copies = [s_name + s_ext] + [f"{s_name}-{i}{s_ext}" for i in range(1, copies)]
@@ -1297,7 +1325,8 @@ async def add_files_to_vdo_playlist(target_folder: str, file_name: str, playlist
                     resolved_files.append(exp)
                 else:
                     cand = None
-                    raw_target = file_name if i == 0 else f"{name}-{i}{ext}"
+                    idx = start_index + i
+                    raw_target = file_name if (start_index == 0 and i == 0) else f"{name}-{idx}{ext}"
                     for alt in [
                         raw_target,
                         raw_target.replace(" ", "-"),
@@ -2420,7 +2449,7 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
     if success:
         update_deletion_entry(file_id, {"playlist_added": True})
         
-        btn_label = "✅ Agregado a la Lista" if copies == 1 else f"✅ Agregado ({count}/10)"
+        btn_label = "✅ Agregado a la Lista" if copies == 1 else f"✅ Agregado ({count}/{copies})"
         current_markup = callback_query.message.reply_markup
         new_rows = []
         if current_markup and current_markup.inline_keyboard:
@@ -2443,7 +2472,7 @@ async def handle_add_playlist_callback(client: Client, callback_query: CallbackQ
         if copies == 1:
             await callback_query.message.reply_text(f"🎵 ✅ **`{file_name}` agregado con éxito a la Lista Musical (VDO Panel)**.")
         else:
-            await callback_query.message.reply_text(f"🎵 ✅ **{count}/10 copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
+            await callback_query.message.reply_text(f"🎵 ✅ **{count}/{copies} copias de `{file_name}` agregadas con éxito a la Lista Musical (VDO Panel)**.")
     else:
         await callback_query.message.reply_text(f"❌ **Error:** No se pudo agregar `{file_name}` a la Lista Musical en VDO Panel. Revisa los logs.")
 
@@ -2846,6 +2875,77 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     elif action == "1w":
         seconds = 86400 * 7
         text_confirm = "1 Semana"
+
+    # Si se selecciona 12 Horas en un video normal (10 copias), crear 20 copias adicionales (total 30)
+    extra_copies_note = ""
+    current_copies = int(info.get("copies", 1 if str(info.get("ftp_path", "")).strip("/").lower() == "youtube" else 10))
+    is_youtube_video = str(info.get("ftp_path", "")).strip("/").lower() == "youtube" or current_copies <= 1
+    if action == "12h" and not is_youtube_video and not info.get("extra_12h_copies_added") and current_copies < 30:
+        await callback_query.answer("⏳ Creando 20 copias adicionales en FTP (total 30)...", show_alert=False)
+        current_markup = callback_query.message.reply_markup
+        if current_markup and current_markup.inline_keyboard:
+            wait_rows = []
+            for row in current_markup.inline_keyboard:
+                new_row = []
+                for btn in row:
+                    cb = btn.callback_data or ""
+                    if cb == f"exp_12h_{file_id}":
+                        new_row.append(InlineKeyboardButton("⏳ 12 Horas (30 copias)...", callback_data=cb))
+                    else:
+                        new_row.append(btn)
+                wait_rows.append(new_row)
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(wait_rows))
+            except Exception:
+                pass
+
+        local_video_path = None
+        try:
+            local_video_path, fresh_exp_info = await resolve_publish_video(
+                client, callback_query.message, file_id
+            )
+            target_folder = fresh_exp_info.get("ftp_path", "")
+            file_name = fresh_exp_info.get("file_name", os.path.basename(local_video_path))
+            extra_count_to_upload = 30 - current_copies
+            await asyncio.to_thread(
+                upload_extra_ftp_copies,
+                local_video_path,
+                file_name,
+                target_folder,
+                current_copies,
+                extra_count_to_upload,
+            )
+            update_deletion_entry(file_id, {
+                "copies": 30,
+                "extra_12h_copies_added": True,
+            })
+            extra_copies_note = f"\n📦 **Copias en FTP:** `30` (se agregaron {extra_count_to_upload} copias adicionales)."
+
+            if fresh_exp_info.get("playlist_added"):
+                extra_ok, extra_added = await add_files_to_vdo_playlist(
+                    target_folder,
+                    file_name,
+                    copies=extra_count_to_upload,
+                    start_index=current_copies,
+                )
+                if extra_ok:
+                    extra_copies_note += f"\n🎵 **Lista Musical:** Se agregaron también las `{extra_added}` copias nuevas (total 30)."
+                else:
+                    extra_copies_note += "\n⚠️ **Lista Musical:** Se subieron las 20 copias al FTP, pero falló añadirlas a VDO Panel."
+        except Exception as e_extra:
+            logger.error(f"Error creando 20 copias adicionales para 12h ({file_id}): {e_extra}")
+            # Restaurar botón 12 Horas sin marcar check
+            if current_markup and current_markup.inline_keyboard:
+                try:
+                    await callback_query.message.edit_reply_markup(reply_markup=current_markup)
+                except Exception:
+                    pass
+            await callback_query.message.reply_text(
+                f"❌ No se pudieron crear las 20 copias adicionales en el FTP:\n`{str(e_extra)}`"
+            )
+            return
+        finally:
+            _cleanup_temp_video(local_video_path)
         
     delete_timestamp = time.time() + seconds
     if not update_deletion_entry(file_id, {
@@ -2859,7 +2959,12 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
     
     fresh_info = get_deletion_entry(file_id) or info
     is_added = fresh_info.get("playlist_added", False)
-    pl_label = "✅ Agregado a la Lista" if is_added else "🎵 Agregar a Lista Musical"
+    total_copies = int(fresh_info.get("copies", 10))
+    pl_label = (
+        ("✅ Agregado a la Lista" if total_copies == 1 else f"✅ Agregado ({total_copies}/{total_copies})")
+        if is_added
+        else "🎵 Agregar a Lista Musical"
+    )
     pl_callback = f"noop_{file_id}" if is_added else f"addpl_{file_id}"
     pl_btn = InlineKeyboardButton(pl_label, callback_data=pl_callback)
 
@@ -2895,7 +3000,7 @@ async def handle_expiration_callback(client: Client, callback_query: CallbackQue
 
     await edit_message_or_caption(
         callback_query.message,
-        current_content + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla).",
+        current_content + f"\n\n✅ **Autodestrucción programada:**\nEl archivo se eliminará en {text_confirm} ({date_str} - Hora Vzla)." + extra_copies_note,
         reply_markup=InlineKeyboardMarkup(new_rows)
     )
     await callback_query.answer(f"✅ Configurado: {text_confirm}")
@@ -3892,7 +3997,7 @@ def keep_alive_ping():
         except Exception as e:
             logger.warning(f"Error en auto-ping interno: {e}")
 
-def ftp_delete_file(target_folder, file_name):
+def ftp_delete_file(target_folder, file_name, copies: int = 10):
     try:
         ftp = FTP(FTP_HOST)
         ftp.login(user=FTP_USER, passwd=FTP_PASS)
@@ -3936,9 +4041,16 @@ def ftp_delete_file(target_folder, file_name):
                 except Exception as e:
                     logger.warning(f"No se pudo borrar {target_file}: {e}")
                     
-            # 9 copias
-            for i in range(1, 10):
-                target_copy = f"{b_name}-{i}{ext}"
+            # Copias numeradas (-1 hasta max_copy_index - 1, y cualquier sufijo detectado en existing_files)
+            max_idx = max(10, int(copies or 10))
+            numbered_targets = {f"{b_name}-{i}{ext}" for i in range(1, max_idx)}
+            if existing_files:
+                pattern = re.compile(rf"^{re.escape(b_name)}-(\d+){re.escape(ext)}$")
+                for ef in existing_files:
+                    if pattern.match(ef):
+                        numbered_targets.add(ef)
+
+            for target_copy in sorted(numbered_targets):
                 if not existing_files or target_copy in existing_files:
                     try:
                         ftp.delete(target_copy)
@@ -3971,7 +4083,7 @@ def auto_delete_worker():
                     file_name = info.get("file_name", "")
                     
                     logger.info(f"Eliminando archivo caducado: {file_name} de {ftp_path}")
-                    success = ftp_delete_file(ftp_path, file_name)
+                    success = ftp_delete_file(ftp_path, file_name, copies=info.get("copies", 10))
                     
                     # Eliminar también el audio en Dropbox solo si fue subido a Dropbox
                     dbx_deleted = False
